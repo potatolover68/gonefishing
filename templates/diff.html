@@ -1,0 +1,12 @@
+{% extends "base.html" %} {% block title %}diff{% endblock %} {% block body %}
+<h1>
+  Notes diff for
+  <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
+    >{{ entry.tag_label() }}</a
+  >
+</h1>
+<h2>Before</h2>
+<p style="white-space: pre-wrap">{{ entry.note_before() }}</p>
+<h2>After</h2>
+<p style="white-space: pre-wrap">{{ entry.note_after() }}</p>
+{% endblock %}

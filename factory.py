@@ -1,0 +1,722 @@
+"""Flask lookup app. Wikimedia login is required for every page except login."""
+
+import json
+import os
+import secrets
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+import numpy as np
+from authlib.integrations.base_client import OAuthError
+from authlib.integrations.flask_client import OAuth
+from flask import (
+    Flask,
+    abort,
+    current_app,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+
+from authorship.corpus import Document, load_documents
+from authorship.lookup import AuthorStore
+from diffproc.config import GroupThresholds, PipelineConfig
+from diffproc.fetch import RevisionCache, WikiClient
+from identity import (
+    account_stats,
+    block_text,
+    clerk_keys,
+    name_key,
+    named_allowed,
+    normalize_username,
+    parse_timestamp,
+)
+from models import AppUser, LogEntry, Tag, TagMember, WikiProfile, db
+from scripts.collect_good_diffs import collect_user, included_namespaces, load_env
+
+ROOT = Path(__file__).resolve().parent
+MODEL_ID = "rrivera1849/LUAR-MUD"
+MAX_USEFUL = 500
+OPEN_ENDPOINTS = {"login", "login_start", "callback"}
+
+
+@dataclass
+class ViewRow:
+    kind: str
+    name: str
+    similarity: float | None = None
+    stats: str = ""
+    block: str = ""
+    edits: int | None = None
+    created: str = ""
+    blocked: bool = False
+    tags: list[tuple[str, str]] = field(default_factory=list)
+    talk: str = ""
+    contribs: str = ""
+    centralauth: str = ""
+    blocklog: str = ""
+
+
+def wiki_slug(name: str) -> str:
+    return quote(name.replace(" ", "_"), safe="")
+
+
+def account_links(name: str) -> dict[str, str]:
+    slug = wiki_slug(name)
+    return {
+        "talk": f"https://en.wikipedia.org/wiki/User_talk:{slug}",
+        "contribs": f"https://en.wikipedia.org/wiki/Special:Contributions/{slug}",
+        "centralauth": f"https://meta.wikimedia.org/wiki/Special:CentralAuth/{slug}",
+        "blocklog": f"https://en.wikipedia.org/wiki/Special:Log/block?page=User:{slug}",
+    }
+
+
+def create_app(
+    init_heavy: bool | None = None,
+    root: Path | None = None,
+    db_path: Path | None = None,
+) -> Flask:
+    root = root or ROOT
+    if init_heavy is None:
+        init_heavy = True
+    app = Flask(__name__, template_folder=str(root / "templates"))
+    env = load_env(root / ".env") if (root / ".env").exists() else {}
+    data = root / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    database = (db_path or (data / "app.sqlite")).resolve()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + database.as_posix()
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["SECRET_KEY"] = (
+        env.get("SECRET_KEY") or env.get("OAUTH_SECRET") or "gonefishing-dev"
+    )
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    db.init_app(app)
+    oauth = OAuth(app)
+    oauth.register(
+        name="wikimedia",
+        client_id=env.get("OAUTH_KEY") or "missing",
+        client_secret=env.get("OAUTH_SECRET") or "missing",
+        access_token_url="https://meta.wikimedia.org/w/rest.php/oauth2/access_token",
+        authorize_url="https://meta.wikimedia.org/w/rest.php/oauth2/authorize",
+        api_base_url="https://meta.wikimedia.org/w/rest.php/oauth2/resource/",
+        client_kwargs={"scope": "basic"},
+    )
+    app.extensions["oauth"] = oauth
+    app.extensions["gone"] = {
+        "env": env,
+        "root": root,
+        "allowlist": clerk_keys(data / "allowlist.txt"),
+        "client": None,
+        "store": None,
+        "encoder": None,
+        "config": None,
+        "namespaces": None,
+    }
+    with app.app_context():
+        db.create_all()
+        _ensure_tag_notes()
+        if init_heavy:
+            _load_services(app, env, root)
+
+    @app.context_processor
+    def inject():
+        return {"csrf": csrf_token(), "me": session.get("username", "")}
+
+    @app.before_request
+    def guard():
+        if request.method == "POST" and request.form.get("csrf") != session.get("csrf"):
+            abort(400)
+        if request.endpoint in OPEN_ENDPOINTS:
+            return None
+        if session.get("user_id"):
+            return None
+        return redirect(url_for("login"))
+
+    @app.get("/login")
+    def login():
+        if session.get("user_id"):
+            return redirect(url_for("index"))
+        return render_template(
+            "login.html",
+            denied=request.args.get("denied"),
+            failed=request.args.get("failed"),
+        )
+
+    @app.get("/login/wikimedia")
+    def login_start():
+        return oauth.wikimedia.authorize_redirect()
+
+    @app.get("/callback")
+    def callback():
+        try:
+            token = oauth.wikimedia.authorize_access_token()
+            profile = oauth.wikimedia.get("profile", token=token).json()
+        except (OAuthError, OSError, ValueError):
+            return redirect(url_for("login", failed=1))
+        username = ""
+        if isinstance(profile, dict):
+            username = str(profile.get("username") or profile.get("name") or "")
+        username = normalize_username(username)
+        if not username or not _privileged(username):
+            session.clear()
+            return redirect(url_for("login", denied=1))
+        actor = _actor(username)
+        session.clear()
+        session["user_id"] = actor.id
+        session["username"] = actor.username
+        session["csrf"] = secrets.token_urlsafe(32)
+        return redirect(url_for("index"))
+
+    @app.post("/logout")
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
+
+    @app.get("/")
+    def index():
+        subject = normalize_username(request.args.get("user", ""))
+        rows: list[ViewRow] = []
+        notice = ""
+        if subject:
+            if not _services()["store"].has_user(subject):
+                notice = "No usable edits were stored for that account."
+            else:
+                rows = _comparison(subject)
+                if not rows:
+                    notice = "Nothing to compare."
+        return render_template("index.html", subject=subject, rows=rows, notice=notice)
+
+    @app.post("/lookup")
+    def lookup():
+        username = normalize_username(request.form.get("username", ""))
+        if not username:
+            return redirect(url_for("index"))
+        store = _services()["store"]
+        refresh = request.form.get("refresh") == "on"
+        if refresh:
+            WikiProfile.query.filter_by(wiki_username=username).delete()
+        if refresh or not store.has_user(username):
+            _collect(username)
+        _log("lookup", lookup_name=username, useful_count=store.count(username))
+        db.session.commit()
+        return redirect(url_for("index", user=username))
+
+    @app.post("/tags")
+    def add_tag():
+        subject = normalize_username(request.form.get("subject", ""))
+        tag_name = request.form.get("tag", "").strip()
+        selected = [
+            normalize_username(name)
+            for name in request.form.getlist("account")
+            if name.strip()
+        ]
+        if tag_name and "/" not in tag_name and selected:
+            tag = _tag(tag_name)
+            actor = _current_actor()
+            added: list[str] = []
+            for name in selected:
+                exists = TagMember.query.filter_by(
+                    tag_id=tag.id, wiki_username=name
+                ).one_or_none()
+                if exists is not None:
+                    continue
+                db.session.add(
+                    TagMember(
+                        tag_id=tag.id,
+                        wiki_username=name,
+                        added_by_id=actor.id,
+                        added_at=datetime.now(timezone.utc),
+                    )
+                )
+                added.append(name)
+            if added:
+                _log(
+                    "tag_add",
+                    tag=tag,
+                    users=added,
+                    added_by={name: actor.username for name in added},
+                )
+                _forget_tag_scores(tag.name)
+            db.session.commit()
+        return redirect(url_for("index", user=subject) if subject else url_for("index"))
+
+    @app.get("/tag/<name>")
+    def tag_page(name: str):
+        tag = Tag.query.filter_by(name=name).one_or_none()
+        if tag is None:
+            abort(404)
+        members = (
+            TagMember.query.filter_by(tag_id=tag.id)
+            .order_by(TagMember.wiki_username)
+            .all()
+        )
+        names = [member.wiki_username for member in members]
+        rows = _person_rows(names, similarities=None)
+        return render_template(
+            "tag.html", tag=tag, rows=rows, member_count=len(members)
+        )
+
+    @app.post("/tag/<name>/notes")
+    def save_notes(name: str):
+        tag = Tag.query.filter_by(name=name).one_or_none()
+        if tag is None:
+            abort(404)
+        updated = request.form.get("notes", "").replace("\r\n", "\n")
+        previous = tag.notes or ""
+        if updated != previous:
+            tag.notes = updated
+            _log("note_edit", tag=tag, before=previous, after=updated)
+            db.session.commit()
+        return redirect(url_for("tag_page", name=tag.name))
+
+    @app.post("/tag/<name>/delete")
+    def delete_tag(name: str):
+        tag = Tag.query.filter_by(name=name).one_or_none()
+        if tag is None:
+            abort(404)
+        if TagMember.query.filter_by(tag_id=tag.id).count():
+            abort(400)
+        label = tag.name
+        _log("tag_delete", tag=tag)
+        db.session.flush()
+        for entry in LogEntry.query.filter_by(tag_id=tag.id):
+            data = json.loads(entry.payload or "{}")
+            if not isinstance(data, dict):
+                data = {}
+            data["tag_name"] = label
+            entry.payload = json.dumps(data)
+            entry.tag_id = None
+        db.session.delete(tag)
+        db.session.commit()
+        return redirect(url_for("tags"))
+
+    @app.get("/tags")
+    def tags():
+        found = Tag.query.order_by(Tag.name).all()
+        listed = [
+            (tag, TagMember.query.filter_by(tag_id=tag.id).count()) for tag in found
+        ]
+        return render_template("tags.html", tags=listed)
+
+    @app.post("/tag/<name>/remove")
+    def remove_tag(name: str):
+        tag = Tag.query.filter_by(name=name).one_or_none()
+        if tag is None:
+            abort(404)
+        selected = {
+            normalize_username(item)
+            for item in request.form.getlist("account")
+            if item.strip()
+        }
+        members = [
+            member
+            for member in TagMember.query.filter_by(tag_id=tag.id)
+            if member.wiki_username in selected
+        ]
+        if members:
+            added_by = {
+                member.wiki_username: member.added_by.username for member in members
+            }
+            users = [member.wiki_username for member in members]
+            for member in members:
+                db.session.delete(member)
+            _log("tag_remove", tag=tag, users=users, added_by=added_by)
+            _forget_tag_scores(tag.name)
+            db.session.commit()
+        return redirect(url_for("tag_page", name=tag.name))
+
+    @app.get("/log")
+    def log():
+        page_num = request.args.get("page", 1, type=int)
+        page = LogEntry.query.order_by(LogEntry.id.desc()).paginate(
+            page=page_num, per_page=50, error_out=False
+        )
+        return render_template("log.html", page=page)
+
+    @app.post("/log/<int:entry_id>/undo")
+    def undo(entry_id: int):
+        entry = db.session.get(LogEntry, entry_id)
+        if (
+            entry is None
+            or entry.undone
+            or entry.action not in {"tag_add", "tag_remove", "undo_add", "undo_remove"}
+        ):
+            abort(404)
+        tag = entry.tag
+        if tag is None:
+            abort(404)
+        actor = _current_actor()
+        users = entry.names()
+        if entry.action in {"tag_add", "undo_remove"}:
+            for member in TagMember.query.filter_by(tag_id=tag.id):
+                if member.wiki_username in users:
+                    db.session.delete(member)
+            _log("undo_add", tag=tag, users=users, added_by=entry.added_by_map())
+        else:
+            restored: list[str] = []
+            adders = entry.added_by_map()
+            for name in users:
+                if TagMember.query.filter_by(
+                    tag_id=tag.id, wiki_username=name
+                ).one_or_none():
+                    continue
+                adder = _actor(adders.get(name) or actor.username)
+                db.session.add(
+                    TagMember(
+                        tag_id=tag.id,
+                        wiki_username=name,
+                        added_by_id=adder.id,
+                        added_at=datetime.now(timezone.utc),
+                    )
+                )
+                restored.append(name)
+            _log("undo_remove", tag=tag, users=restored or users, added_by=adders)
+        _forget_tag_scores(tag.name)
+        entry.undone = True
+        db.session.commit()
+        return redirect(url_for("log"))
+
+    @app.get("/log/<int:entry_id>/diff")
+    def log_diff(entry_id: int):
+        entry = db.session.get(LogEntry, entry_id)
+        if entry is None or entry.action != "note_edit":
+            abort(404)
+        return render_template("diff.html", entry=entry)
+
+    return app
+
+
+def csrf_token() -> str:
+    token = session.get("csrf")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf"] = token
+    return token
+
+
+def _services() -> dict:
+    return current_app.extensions["gone"]
+
+
+def _load_services(app: Flask, env: dict[str, str], root: Path) -> None:
+    config = PipelineConfig(
+        user_agent="gonefishing/0.1 by en:User:MSK <thewonderfulworldofpotatoes at gmail dot com>",
+        content=GroupThresholds(
+            min_sizediff=80, min_prose_chars=80, min_sentences=1, min_prose_ratio=0.0
+        ),
+        is_bot=True,
+    )
+    cache = RevisionCache(root / "data" / "revisions.sqlite")
+    client = WikiClient(config, cache)
+    client.login(env["USER"], env["PASS"])
+    namespaces = included_namespaces(client)
+    store = AuthorStore(root / "data" / "authors.sqlite")
+    store.import_corpus(root / "data" / "good_diffs")
+    if os.environ.get("GONEFISHING_REMOTE_ENCODER") == "1":
+        from encoder_service import RemoteLuarEncoder
+
+        encoder = RemoteLuarEncoder()
+    else:
+        from authorship.encode import LuarEncoder
+
+        encoder = LuarEncoder(
+            MODEL_ID,
+            adapter=str(root / "data" / "luar_mud_lora"),
+            token=env.get("HF_TOKEN") or None,
+        )
+    app.extensions["gone"].update(
+        {
+            "config": config,
+            "client": client,
+            "namespaces": namespaces,
+            "store": store,
+            "encoder": encoder,
+        }
+    )
+
+
+def _privileged(username: str) -> bool:
+    gone = _services()
+    if named_allowed(username, gone["allowlist"]):
+        return True
+    client = gone.get("client")
+    if client is None:
+        return False
+    try:
+        if "checkuser" in client.local_groups(username):
+            return True
+        if "steward" in client.global_groups(username):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _actor(username: str) -> AppUser:
+    found = AppUser.query.filter_by(username=username).one_or_none()
+    if found is not None:
+        return found
+    found = AppUser(username=username)
+    db.session.add(found)
+    db.session.commit()
+    return found
+
+
+def _current_actor() -> AppUser:
+    actor = db.session.get(AppUser, session.get("user_id"))
+    if actor is None:
+        abort(403)
+    return actor
+
+
+def _tag(name: str) -> Tag:
+    cleaned = name.strip()
+    existing = Tag.query.filter(
+        db.func.lower(Tag.name) == cleaned.casefold()
+    ).one_or_none()
+    if existing is not None:
+        return existing
+    created = Tag(name=cleaned)
+    db.session.add(created)
+    db.session.flush()
+    return created
+
+
+def _log(
+    action: str,
+    *,
+    tag: Tag | None = None,
+    users: list[str] | None = None,
+    added_by: dict[str, str] | None = None,
+    lookup_name: str | None = None,
+    useful_count: int | None = None,
+    before: str | None = None,
+    after: str | None = None,
+) -> None:
+    payload = {"users": users or [], "added_by": added_by or {}}
+    if tag is not None:
+        payload["tag_name"] = tag.name
+    if before is not None:
+        payload["before"] = before
+    if after is not None:
+        payload["after"] = after
+    entry = LogEntry(
+        actor_id=_current_actor().id,
+        action=action,
+        tag_id=None if tag is None else tag.id,
+        lookup_name=lookup_name,
+        useful_count=useful_count,
+        payload=json.dumps(payload),
+        undone=False,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.session.add(entry)
+
+
+def _ensure_tag_notes() -> None:
+    rows = db.session.execute(db.text("PRAGMA table_info(tags)")).fetchall()
+    names = {row[1] for row in rows}
+    if rows and "notes" not in names:
+        db.session.execute(
+            db.text("ALTER TABLE tags ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+        )
+        db.session.commit()
+
+
+def _forget_tag_scores(tag_name: str) -> None:
+    store = _services().get("store")
+    if store is not None:
+        store.drop_tag_scores(tag_name)
+
+
+def _collect(username: str) -> int:
+    gone = _services()
+    with tempfile.TemporaryDirectory() as directory:
+        dest = Path(directory) / "user.jsonl"
+        kept = collect_user(
+            gone["client"],
+            username,
+            gone["namespaces"],
+            gone["config"],
+            dest,
+            max_useful=MAX_USEFUL,
+            max_scanned=MAX_USEFUL * 10,
+        )
+        loaded = [
+            Document(username, document.revid, document.pageid, document.prose)
+            for docs in load_documents(dest).values()
+            for document in docs
+        ]
+    if loaded:
+        gone["store"].replace_user(loaded)
+    return kept
+
+
+def _ensure_vector(user: str):
+    gone = _services()
+    store: AuthorStore = gone["store"]
+    cached = store.vector(user)
+    if cached is not None:
+        return cached
+    prose = store.prose(user)[:MAX_USEFUL]
+    if not prose:
+        return None
+    store.put_vector(user, gone["encoder"].embed_episode(prose))
+    return store.vector(user)
+
+
+def _memberships(names: list[str]) -> dict[str, list[tuple[str, str]]]:
+    grouped: dict[str, list[tuple[str, str]]] = {name: [] for name in names}
+    if not names:
+        return grouped
+    members = TagMember.query.filter(TagMember.wiki_username.in_(names)).all()
+    for member in members:
+        grouped.setdefault(member.wiki_username, []).append(
+            (member.tag.name, member.added_by.username)
+        )
+    for items in grouped.values():
+        items.sort(key=lambda item: item[0].casefold())
+    return grouped
+
+
+def _facts(names: list[str]) -> dict[str, dict]:
+    if not names:
+        return {}
+    rows = WikiProfile.query.filter(WikiProfile.wiki_username.in_(names)).all()
+    indexed = {_profile_key(row): _profile_info(row) for row in rows}
+    missing = [name for name in names if name_key(name) not in indexed]
+    client = _services().get("client")
+    if missing and client is not None:
+        try:
+            raw = client.user_facts(missing)
+        except Exception:
+            raw = {}
+        for info in raw.values():
+            name = str(info.get("name") or "")
+            if not name:
+                continue
+            profile = WikiProfile(
+                wiki_username=name,
+                editcount=int(info.get("editcount") or 0),
+                registration=str(info.get("registration") or ""),
+                blockedtimestamp=str(info.get("blockedtimestamp") or ""),
+                blockedby=str(info.get("blockedby") or ""),
+                blockreason=str(info.get("blockreason") or ""),
+            )
+            db.session.merge(profile)
+            indexed[name_key(name)] = _profile_info(profile)
+        db.session.commit()
+    return indexed
+
+
+def _profile_key(row: WikiProfile) -> str:
+    return name_key(row.wiki_username)
+
+
+def _profile_info(row: WikiProfile) -> dict:
+    return {
+        "editcount": row.editcount,
+        "registration": row.registration,
+        "blockedtimestamp": row.blockedtimestamp,
+        "blockedby": row.blockedby,
+        "blockreason": row.blockreason,
+    }
+
+
+def _person_rows(
+    names: list[str], similarities: dict[str, float] | None
+) -> list[ViewRow]:
+    now = datetime.now(timezone.utc)
+    store: AuthorStore | None = _services().get("store")
+    facts = _facts(names)
+    tags = _memberships(names)
+    counts = {} if store is None else store.counts()
+    rows: list[ViewRow] = []
+    for name in names:
+        info = facts.get(name_key(name), {})
+        useful = counts.get(name, 0)
+        links = account_links(name)
+        score = None if similarities is None else similarities.get(name)
+        registered = parse_timestamp(str(info.get("registration") or ""))
+        rows.append(
+            ViewRow(
+                kind="person",
+                name=name,
+                similarity=score,
+                stats=account_stats(
+                    int(info.get("editcount") or 0),
+                    str(info.get("registration") or ""),
+                    useful,
+                    now,
+                ),
+                block=block_text(info),
+                edits=int(info.get("editcount") or 0),
+                created=registered.date().isoformat() if registered else "",
+                blocked=bool(info.get("blockedtimestamp")),
+                tags=tags.get(name, []),
+                talk=links["talk"],
+                contribs=links["contribs"],
+                centralauth=links["centralauth"],
+                blocklog=links["blocklog"],
+            )
+        )
+    return rows
+
+
+def _member_key(names: list[str]) -> str:
+    return "\n" + "\n".join(sorted(names, key=str.casefold)) + "\n"
+
+
+def _comparison(subject: str) -> list[ViewRow]:
+    gone = _services()
+    store: AuthorStore = gone["store"]
+    query_vector = _ensure_vector(subject)
+    if query_vector is None:
+        return []
+    authors = [
+        author for author in store.users() if name_key(author) != name_key(subject)
+    ]
+    scores = store.scores_for(subject)
+    missing = [author for author in authors if author not in scores]
+    fresh: dict[str, float] = {}
+    for author in missing:
+        vector = _ensure_vector(author)
+        if vector is None:
+            continue
+        fresh[author] = float(np.dot(query_vector, vector))
+    if fresh:
+        store.put_scores(subject, fresh)
+        scores.update(fresh)
+    rows = _person_rows([author for author in authors if author in scores], scores)
+    subject_key = name_key(subject)
+    for tag in Tag.query.order_by(Tag.name).all():
+        members = [
+            member.wiki_username
+            for member in TagMember.query.filter_by(tag_id=tag.id)
+            if name_key(member.wiki_username) != subject_key
+        ]
+        if not members:
+            continue
+        members_key = _member_key(members)
+        cached = store.tag_score(subject, tag.name, members_key)
+        if cached is None:
+            prose: list[str] = []
+            for member in members:
+                prose.extend(store.prose(member))
+            if not prose:
+                continue
+            cached = float(np.dot(query_vector, gone["encoder"].embed_episode(prose)))
+            store.put_tag_score(subject, tag.name, members_key, cached)
+        rows.append(ViewRow(kind="tag", name=tag.name, similarity=cached))
+    rows.sort(
+        key=lambda row: row.similarity if row.similarity is not None else -1,
+        reverse=True,
+    )
+    return rows

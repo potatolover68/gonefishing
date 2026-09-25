@@ -1,0 +1,181 @@
+<table style="width: 100%">
+  <thead>
+    <tr>
+      <th></th>
+      <th>Account</th>
+      <th>edit count</th>
+      <th>block info</th>
+      <th>tags</th>
+      {% if show_similarity %}
+      <th>similarity</th>
+      {% endif %}
+    </tr>
+  </thead>
+  <tbody id="main-rows">
+    {% for row in rows %}
+    <tr
+      data-kind="{{ row.kind }}"
+      data-account="{{ row.name }}"
+      data-block="{{ row.block }}"
+      data-edits="{{ row.edits if row.edits is not none else '' }}"
+      data-created="{{ row.created }}"
+      data-blocked="{{ '1' if row.blocked else '0' }}"
+    >
+      <td>
+        {% if row.kind == "person" %}<input
+          type="checkbox"
+          name="account"
+          value="{{ row.name }}"
+        />{% endif %}
+      </td>
+      <td>
+        {% if row.kind == "tag" %}
+        <a class="tag" href="{{ url_for('tag_page', name=row.name) }}"
+          >{{ row.name }}</a
+        >
+        {% else %} {{ row.name }} (<a href="{{ row.talk }}">talk</a> |
+        <a href="{{ row.contribs }}">contribs</a> |
+        <a href="{{ row.centralauth }}">centralauth</a> |
+        <a href="{{ row.blocklog }}">block log</a>) {% endif %}
+      </td>
+      <td>{{ row.stats | safe }}</td>
+      <td>{{ row.block }}</td>
+      <td>
+        {% for tag_name, adder in row.tags %}
+        <a
+          class="tag"
+          href="{{ url_for('tag_page', name=tag_name) }}"
+          title="Added by {{ adder }}"
+          >{{ tag_name }}</a
+        >{% if not loop.last %}, {% endif %} {% endfor %}
+      </td>
+      {% if show_similarity %}
+      <td>
+        {% if row.similarity is not none %}{{ "%.4f"|format(row.similarity) }}{%
+        endif %}
+      </td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </tbody>
+  <tbody id="tail-rows"></tbody>
+</table>
+<script>
+  (function () {
+    var query = document.getElementById("q");
+    var maxEdits = document.getElementById("max-edits");
+    var createdBefore = document.getElementById("created-before");
+    var blockedOnly = document.getElementById("blocked-only");
+    var main = document.getElementById("main-rows");
+    var tail = document.getElementById("tail-rows");
+    var last = null;
+    if (!query || !maxEdits || !createdBefore || !blockedOnly || !main || !tail)
+      return;
+
+    function boxes() {
+      return Array.prototype.slice.call(
+        document.querySelectorAll("#accounts input[type=checkbox]"),
+      );
+    }
+
+    function matches(row) {
+      var q = query.value.trim().toLowerCase();
+      if (q) {
+        var haystack = (
+          (row.dataset.account || "") +
+          " " +
+          (row.dataset.block || "")
+        ).toLowerCase();
+        if (haystack.indexOf(q) === -1) return false;
+      }
+      if (row.dataset.kind === "tag") return true;
+      if (maxEdits.value !== "" && row.dataset.edits !== "") {
+        if (Number(row.dataset.edits) > Number(maxEdits.value)) return false;
+      }
+      if (
+        createdBefore.value &&
+        row.dataset.created &&
+        row.dataset.created < createdBefore.value
+      ) {
+        return false;
+      }
+      if (blockedOnly.checked && row.dataset.blocked !== "1") return false;
+      return true;
+    }
+
+    function applyFilter() {
+      var rows = Array.prototype.slice
+        .call(main.querySelectorAll("tr"))
+        .concat(Array.prototype.slice.call(tail.querySelectorAll("tr")));
+      rows.forEach(function (row) {
+        var box = row.querySelector("input[type=checkbox]");
+        var selected = box && box.checked;
+        if (matches(row)) {
+          row.hidden = false;
+          row.classList.remove("filtered");
+          main.appendChild(row);
+        } else if (selected) {
+          row.hidden = false;
+          row.classList.add("filtered");
+          tail.appendChild(row);
+        } else {
+          row.hidden = true;
+          row.classList.remove("filtered");
+          main.appendChild(row);
+        }
+      });
+    }
+
+    query.addEventListener("input", applyFilter);
+    maxEdits.addEventListener("input", applyFilter);
+    createdBefore.addEventListener("input", applyFilter);
+    blockedOnly.addEventListener("change", applyFilter);
+    document
+      .getElementById("select-all")
+      .addEventListener("click", function () {
+        Array.prototype.forEach.call(
+          main.querySelectorAll("tr"),
+          function (row) {
+            var box = row.querySelector("input[type=checkbox]");
+            if (box && !row.hidden && !row.classList.contains("filtered"))
+              box.checked = true;
+          },
+        );
+      });
+    document
+      .getElementById("unselect-all")
+      .addEventListener("click", function () {
+        Array.prototype.forEach.call(
+          main.querySelectorAll("tr"),
+          function (row) {
+            var box = row.querySelector("input[type=checkbox]");
+            if (box && !row.hidden && !row.classList.contains("filtered"))
+              box.checked = false;
+          },
+        );
+      });
+    document
+      .getElementById("accounts")
+      .addEventListener("click", function (event) {
+        var box = event.target;
+        if (!box || box.type !== "checkbox") return;
+        if (event.shiftKey && last) {
+          var all = boxes();
+          var start = all.indexOf(last);
+          var end = all.indexOf(box);
+          if (start !== -1 && end !== -1) {
+            var lo = Math.min(start, end);
+            var hi = Math.max(start, end);
+            for (var i = lo; i <= hi; i++) all[i].checked = box.checked;
+          }
+          applyFilter();
+        }
+        last = box;
+      });
+    document
+      .getElementById("accounts")
+      .addEventListener("change", function (event) {
+        if (event.target && event.target.type === "checkbox") applyFilter();
+      });
+  })();
+</script>

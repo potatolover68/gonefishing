@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='normalize.css') }}"
+    />
+    <meta charset="utf-8" />
+    <title>🎣{% block title %}gone fishing{% endblock %}</title>
+    <style>
+      a.tag {
+        text-decoration: underline dotted;
+      }
+      a.tag:hover {
+        text-decoration: underline solid;
+      }
+      tr.filtered {
+        background: #ccc;
+      }
+      button:disabled {
+        color: gray;
+      }
+      #nav {
+        position: absolute;
+        top: 8px;
+        right: calc(8px + 0.25em);
+      }
+      #nav > *:not(:last-child, #logout-form)::after {
+        content: "|";
+        margin: 0 0.25em;
+      }
+      body {
+        margin: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    {% if me %}
+    <form
+      id="logout-form"
+      method="post"
+      action="{{ url_for('logout') }}"
+      style="display: none"
+    >
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+    </form>
+    <nav id="nav">
+      <span>🎣</span>
+      <a href="{{ url_for('index') }}">Lookup</a>
+      <a href="{{ url_for('tags') }}">Tags</a>
+      <a href="{{ url_for('log') }}">Log</a>
+      <a
+        href="{{ url_for('logout') }}?csrf={{ csrf }}"
+        onclick="
+          event.preventDefault();
+          document.getElementById('logout-form').submit();
+        "
+        >Log out</a
+      >
+    </nav>
+    {% endif %} {% block body %}{% endblock %}
+    <script>
+      document.querySelectorAll("form[data-working]").forEach(function (form) {
+        form.addEventListener("submit", function () {
+          var button = form.querySelector("button");
+          if (!button) return;
+          var label = form.getAttribute("data-working");
+          var started = Date.now();
+          button.disabled = true;
+          function tick() {
+            var elapsed = Math.floor((Date.now() - started) / 1000);
+            button.textContent = label + " - working for " + elapsed + "s";
+          }
+          tick();
+          window.setInterval(tick, 1000);
+        });
+      });
+    </script>
+  </body>
+</html>

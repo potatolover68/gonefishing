@@ -1,0 +1,85 @@
+{% extends "base.html" %} {% block title %}log{% endblock %} {% block body %}
+<ul>
+  {% for entry in page.items %}
+  <li>
+    <time>{{ entry.stamp() }}</time>: {{ entry.actor.username }} {% if
+    entry.action == "lookup" %} looked up {{ entry.lookup_name }} ({{
+    entry.useful_count }} useful edits) {% elif entry.action == "tag_add" %}
+    added
+    <span
+      style="text-decoration: underline dotted"
+      title="{{ entry.names()|join(', ') }}"
+      >{{ entry.names()|length }} users</span
+    >
+    to the tag
+    <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
+      >{{ entry.tag_label() }}</a
+    >
+    {% elif entry.action == "tag_remove" %} removed
+    <span
+      style="text-decoration: underline dotted"
+      title="{{ entry.names()|join(', ') }}"
+      >{{ entry.names()|length }} users</span
+    >
+    from the tag
+    <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
+      >{{ entry.tag_label() }}</a
+    >
+    {% elif entry.action == "undo_add" %} undid adding
+    <span
+      style="text-decoration: underline dotted"
+      title="{{ entry.names()|join(', ') }}"
+      >{{ entry.names()|length }} users</span
+    >
+    to the tag
+    <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
+      >{{ entry.tag_label() }}</a
+    >
+    {% elif entry.action == "undo_remove" %} undid removing
+    <span
+      style="text-decoration: underline dotted"
+      title="{{ entry.names()|join(', ') }}"
+      >{{ entry.names()|length }} users</span
+    >
+    from the tag
+    <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
+      >{{ entry.tag_label() }}</a
+    >
+    {% elif entry.action == "note_edit" %} edited the notes on
+    <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
+      >{{ entry.tag_label() }}</a
+    >
+    <a href="{{ url_for('log_diff', entry_id=entry.id) }}">diff</a>
+    {% elif entry.action == "tag_delete" %} deleted the empty tag {{
+    entry.tag_label() }} {% endif %} {% if entry.action in ["tag_add",
+    "tag_remove", "undo_add", "undo_remove"] and not entry.undone %}
+    <form
+      method="post"
+      action="{{ url_for('undo', entry_id=entry.id) }}"
+      style="display: inline"
+    >
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <button
+        style="
+          display: inline;
+          vertical-align: middle;
+          padding: 0 0.5em;
+          margin-left: 0.5em;
+        "
+      >
+        undo
+      </button>
+    </form>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+<p>
+  {% if page.has_prev %}<a href="{{ url_for('log', page=page.prev_num) }}"
+    >Previous</a
+  >{% endif %} {% if page.has_next %}<a
+    href="{{ url_for('log', page=page.next_num) }}"
+    >Next</a
+  >{% endif %}
+</p>
+{% endblock %}

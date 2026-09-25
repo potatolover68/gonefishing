@@ -1,0 +1,26 @@
+<p
+  style="
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    width: 100%;
+  "
+>
+  <span>
+    <label>Hide if entry does not contain <input id="q" type="search" /></label>
+    <label>
+      and if edit count is more than
+      <input id="max-edits" type="number" min="0" /> edits</label
+    >
+    <label>
+      and if created before <input id="created-before" type="date"
+    /></label>
+    <label
+      >and if not blocked <input id="blocked-only" type="checkbox" />
+    </label>
+  </span>
+  <span>
+    <button type="button" id="select-all">Select all</button>
+    <button type="button" id="unselect-all">Unselect all</button>
+  </span>
+</p>

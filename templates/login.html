@@ -1,0 +1,24 @@
+{% extends "base.html" %} {% block title %}Log in{% endblock %} {% block body %}
+<h1>gone fishing</h1>
+{% if denied %}
+<p>Your account cannot use this application.</p>
+{% endif %} {% if failed %}
+<p>Wikimedia login failed.</p>
+{% endif %}
+<p><a href="{{ url_for('login_start') }}">Log in</a></p>
+<p>
+  <b>Disclaimer:</b> This tool may not be used as evidence for sockpuppetry, and
+  must only be used as a starting point for further investigation.
+</p>
+<p>
+  <b>Privacy:</b> This tool does not normally collect any personal data, however
+  errors will be logged for debugging purposes.
+</p>
+<p>
+  This tool is restricted to users on the allowlist, enwiki checkusers, and
+  stewards. If you are not on the allowlist, you will not be able to use this
+  tool. Contact <a href="https://en.wikipedia.org/wiki/User:MSK">MSK</a> offwiki
+  via email (<code>thewonderfulworldofpotatoes at gmail dot com</code>) to be
+  added to the allowlist.
+</p>
+{% endblock %}

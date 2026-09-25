@@ -1,0 +1,28 @@
+{% extends "base.html" %} {% block body %}
+<form method="post" action="{{ url_for('lookup') }}" data-working="Compare">
+  <input type="hidden" name="csrf" value="{{ csrf }}" />
+  <label
+    >Wikipedia username <input name="username" value="{{ subject }}"
+  /></label>
+  <label
+    ><input type="checkbox" name="refresh" /> Collect again if this account is
+    already stored</label
+  >
+  <button>Compare</button>
+</form>
+{% if notice %}
+<p>{{ notice }}</p>
+{% endif %} {% if rows %} {% include "filters.html" %}
+<form
+  id="accounts"
+  method="post"
+  action="{{ url_for('add_tag') }}"
+  data-working="Add to tag"
+>
+  <input type="hidden" name="csrf" value="{{ csrf }}" />
+  <input type="hidden" name="subject" value="{{ subject }}" />
+  <label>Tag <input name="tag" /></label>
+  <button>Add to tag</button>
+  {% set show_similarity = true %} {% include "account_table.html" %}
+</form>
+{% endif %} {% endblock %}

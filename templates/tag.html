@@ -1,0 +1,41 @@
+{% extends "base.html" %} {% block title %}{{ tag.name }}{% endblock %} {% block
+body %}
+<h1>{{ tag.name }}</h1>
+<p id="tag-notes" style="white-space: pre-wrap">{{ tag.notes }}</p>
+<button type="button" id="edit-notes">Edit</button>
+<form
+  id="notes-form"
+  method="post"
+  action="{{ url_for('save_notes', name=tag.name) }}"
+  hidden
+>
+  <input type="hidden" name="csrf" value="{{ csrf }}" />
+  <textarea name="notes" rows="8" style="width: 100%">{{ tag.notes }}</textarea>
+  <button>Save</button>
+</form>
+{% if member_count == 0 %}
+<form method="post" action="{{ url_for('delete_tag', name=tag.name) }}">
+  <input type="hidden" name="csrf" value="{{ csrf }}" />
+  <button>Delete empty tag</button>
+</form>
+{% endif %} {% include "filters.html" %}
+<div>
+  <form
+    id="accounts"
+    method="post"
+    action="{{ url_for('remove_tag', name=tag.name) }}"
+    data-working="Remove"
+  >
+    <input type="hidden" name="csrf" value="{{ csrf }}" />
+    <button>Remove</button>
+    {% set show_similarity = false %} {% include "account_table.html" %}
+  </form>
+</div>
+<script>
+  document.getElementById("edit-notes").addEventListener("click", function () {
+    document.getElementById("tag-notes").hidden = true;
+    this.hidden = true;
+    document.getElementById("notes-form").hidden = false;
+  });
+</script>
+{% endblock %}

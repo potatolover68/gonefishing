@@ -76,6 +76,27 @@ def account_links(name: str) -> dict[str, str]:
     }
 
 
+def runtime_data(root: Path) -> Path:
+
+    if os.environ.get("ON_TF"):
+        home = os.environ.get("TOOL_DATA_DIR") or os.environ.get("HOME")
+        if not home:
+            raise RuntimeError("ON_TF is set but HOME is not")
+        data = Path(home) / "gonefishing"
+    else:
+        data = root / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    return data
+
+
+def _allowlist_file(data: Path, root: Path) -> Path:
+    dest = data / "allowlist.txt"
+    bundled = root / "data" / "allowlist.txt"
+    if dest.resolve() != bundled.resolve() and not dest.exists() and bundled.is_file():
+        dest.write_text(bundled.read_text(encoding="utf-8"), encoding="utf-8")
+    return dest
+
+
 def create_app(
     init_heavy: bool | None = None,
     root: Path | None = None,
@@ -85,9 +106,8 @@ def create_app(
     if init_heavy is None:
         init_heavy = True
     app = Flask(__name__, template_folder=str(root / "templates"))
-    env = load_env(root / ".env") if (root / ".env").exists() else {}
-    data = root / "data"
-    data.mkdir(parents=True, exist_ok=True)
+    env = load_env(root / ".env")
+    data = runtime_data(root)
     database = (db_path or (data / "app.sqlite")).resolve()
     database.parent.mkdir(parents=True, exist_ok=True)
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + database.as_posix()
@@ -112,12 +132,13 @@ def create_app(
     app.extensions["gone"] = {
         "env": env,
         "root": root,
-        "allowlist": clerk_keys(data / "allowlist.txt"),
+        "allowlist": clerk_keys(_allowlist_file(data, root)),
         "client": None,
         "store": None,
         "encoder": None,
         "config": None,
         "namespaces": None,
+        "data": data,
     }
     with app.app_context():
         db.create_all()
@@ -413,12 +434,16 @@ def _load_services(app: Flask, env: dict[str, str], root: Path) -> None:
         ),
         is_bot=True,
     )
-    cache = RevisionCache(root / "data" / "revisions.sqlite")
+    data = app.extensions["gone"]["data"]
+    cache = RevisionCache(data / "revisions.sqlite")
     client = WikiClient(config, cache)
     client.login(env["USER"], env["PASS"])
     namespaces = included_namespaces(client)
-    store = AuthorStore(root / "data" / "authors.sqlite")
-    store.import_corpus(root / "data" / "good_diffs")
+    store = AuthorStore(data / "authors.sqlite")
+    corpus = data / "good_diffs"
+    if not corpus.is_dir():
+        corpus = root / "data" / "good_diffs"
+    store.import_corpus(corpus)
     if os.environ.get("GONEFISHING_REMOTE_ENCODER") == "1":
         from encoder_service import RemoteLuarEncoder
 

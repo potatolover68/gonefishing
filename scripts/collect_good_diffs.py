@@ -1,9 +1,12 @@
 """Collect useful diffs per account."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from urllib.parse import quote
+
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -21,14 +24,11 @@ USERS = ROOT / "data" / "autoreviewers.txt"
 OUT = ROOT / "data" / "good_diffs"
 
 
-def load_env(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.lstrip().startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip()
-    return values
+def load_env(path: Path | None = None) -> dict[str, str]:
+    """Load .env without overriding variables already set in the environment."""
+    if path is None or path.exists():
+        load_dotenv(path, override=False)
+    return dict(os.environ)
 
 
 def included_namespaces(client: WikiClient) -> list[int]:
@@ -105,7 +105,9 @@ def collect_user(
                 result = process_edit(contrib, old_text, new_text, config)
                 if not result.useful:
                     continue
-                handle.write(json.dumps(record(contrib, result), ensure_ascii=False) + "\n")
+                handle.write(
+                    json.dumps(record(contrib, result), ensure_ascii=False) + "\n"
+                )
                 kept += 1
         batch.clear()
 
@@ -133,7 +135,11 @@ def main() -> None:
     password = env.get("PASS", "")
     if not username or not password:
         raise SystemExit("USER and PASS are required in .env")
-    users = [line.strip() for line in USERS.read_text(encoding="utf-8").splitlines() if line.strip()]
+    users = [
+        line.strip()
+        for line in USERS.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     OUT.mkdir(parents=True, exist_ok=True)
     config = PipelineConfig(
         user_agent="gonefishing/0.1 by en:User:MSK <thewonderfulworldofpotatoes@gmail.com>",

@@ -175,5 +175,20 @@ def test_notes_empty_tag_and_tag_index(tmp_path):
         assert LogEntry.query.filter_by(action="tag_delete").count() == 1
 
 
+def test_on_tf_keeps_the_database_under_home(tmp_path, monkeypatch):
+    from factory import create_app
+
+    home = tmp_path / "toolhome"
+    monkeypatch.setenv("ON_TF", "1")
+    monkeypatch.setenv("HOME", str(home))
+    repo = tmp_path / "repo"
+    (repo / "templates").mkdir(parents=True)
+    (repo / "data").mkdir()
+    app = create_app(init_heavy=False, root=repo)
+    database = home / "gonefishing" / "app.sqlite"
+    assert database.is_file()
+    assert database.as_posix() in app.config["SQLALCHEMY_DATABASE_URI"]
+
+
 def test_normalize_username():
     assert normalize_username(" User_Tamzin ") == "User Tamzin"

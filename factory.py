@@ -423,6 +423,15 @@ def csrf_token() -> str:
 
 
 def _services() -> dict:
+    gone = current_app.extensions["gone"]
+    if gone.get("client") is None:
+        print("loading wiki client and encoder", flush=True)
+        if os.environ.get("GONEFISHING_REMOTE_ENCODER") == "1":
+            from encoder_service import ensure_encoder_server
+
+            ensure_encoder_server()
+        _load_services(current_app, gone["env"], gone["root"])
+        print("wiki client and encoder ready", flush=True)
     return current_app.extensions["gone"]
 
 
@@ -468,10 +477,10 @@ def _load_services(app: Flask, env: dict[str, str], root: Path) -> None:
 
 
 def _privileged(username: str) -> bool:
-    gone = _services()
+    gone = current_app.extensions["gone"]
     if named_allowed(username, gone["allowlist"]):
         return True
-    client = gone.get("client")
+    client = _services().get("client")
     if client is None:
         return False
     try:

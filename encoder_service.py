@@ -93,6 +93,7 @@ def ensure_encoder_server() -> None:
     except (ConnectionRefusedError, EOFError, OSError, AttributeError):
         pass
     process = subprocess.Popen([sys.executable, str(ROOT / "encoder_service.py")])
+    print("starting encoder", flush=True)
 
     def _stop() -> None:
         if process.poll() is None:

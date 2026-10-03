@@ -228,8 +228,5 @@ __marimo__/
 # throttle
 throttle.ctrl
 
-# allowlist
-data/allowlist.txt
-
 # .lwp files
 *.lwp

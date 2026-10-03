@@ -4,12 +4,13 @@
   <li>
     <time>{{ entry.stamp() }}</time>: {{ entry.actor.username }} {% if
     entry.action == "lookup" %} looked up {{ entry.lookup_name }} ({{
-    entry.useful_count }} useful edits) {% elif entry.action == "tag_add" %}
-    added
+    entry.useful_count }} useful edit{% if entry.useful_count != 1 %}s{% endif
+    %}) {% elif entry.action == "tag_add" %} added
     <span
       style="text-decoration: underline dotted"
       title="{{ entry.names()|join(', ') }}"
-      >{{ entry.names()|length }} users</span
+      >{{ entry.names()|length }} user{% if entry.names()|length != 1 %}s{%
+      endif %}</span
     >
     to the tag
     <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
@@ -19,7 +20,8 @@
     <span
       style="text-decoration: underline dotted"
       title="{{ entry.names()|join(', ') }}"
-      >{{ entry.names()|length }} users</span
+      >{{ entry.names()|length }} user{% if entry.names()|length != 1 %}s{%
+      endif %}</span
     >
     from the tag
     <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
@@ -29,7 +31,8 @@
     <span
       style="text-decoration: underline dotted"
       title="{{ entry.names()|join(', ') }}"
-      >{{ entry.names()|length }} users</span
+      >{{ entry.names()|length }} user{% if entry.names()|length != 1 %}s{%
+      endif %}</span
     >
     to the tag
     <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"
@@ -39,7 +42,8 @@
     <span
       style="text-decoration: underline dotted"
       title="{{ entry.names()|join(', ') }}"
-      >{{ entry.names()|length }} users</span
+      >{{ entry.names()|length }} user{% if entry.names()|length != 1 %}s{%
+      endif %}</span
     >
     from the tag
     <a class="tag" href="{{ url_for('tag_page', name=entry.tag_label()) }}"

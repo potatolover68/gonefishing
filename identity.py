@@ -63,7 +63,7 @@ def account_stats(editcount: int, registration: str, useful: int, now: datetime)
     registered = parse_timestamp(registration)
     if registered is None:
         return f"{editcount} ({useful_bit})"
-    return f"<span title='{useful_bit}'>{editcount}</span> since <span title='{age_phrase(registered, now)}' style='text-decoration: underline dotted;'>{format_day(registered)}</span>"
+    return f"<span title='{useful_bit}' style='text-decoration: underline dotted;'>{editcount}</span> since <span title='{age_phrase(registered, now)}' style='text-decoration: underline dotted;'>{format_day(registered)}</span>"
 
 
 def block_text(info: dict) -> str:

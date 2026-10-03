@@ -33,6 +33,30 @@ class TagMember(db.Model):
     added_by = db.relationship("AppUser")
 
 
+class LookupJob(db.Model):
+    __tablename__ = "lookup_jobs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    actor_id = db.Column(db.Integer, db.ForeignKey("app_users.id"), nullable=False)
+    wiki_username = db.Column(db.String(255), nullable=False)
+    refresh = db.Column(db.Boolean, nullable=False, default=False)
+    status = db.Column(db.String(16), nullable=False, default="queued")
+    useful_count = db.Column(db.Integer, nullable=True)
+    error = db.Column(db.Text, nullable=False, default="")
+    created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    started_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+    actor = db.relationship("AppUser")
+
+    def stamp(self) -> str:
+        moment = self.created_at
+        if moment is None:
+            return ""
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return f"{moment.day} {moment.strftime('%B %Y, %H:%M')} UTC"
+
+
 class WikiProfile(db.Model):
     __tablename__ = "wiki_profiles"
 

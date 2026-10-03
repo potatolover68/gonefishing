@@ -1,5 +1,5 @@
 {% extends "base.html" %} {% block body %}
-<form method="post" action="{{ url_for('lookup') }}" data-working="Compare">
+<form method="post" action="{{ url_for('lookup') }}">
   <input type="hidden" name="csrf" value="{{ csrf }}" />
   <label
     >Wikipedia username <input name="username" value="{{ subject }}"
@@ -10,7 +10,22 @@
   >
   <button>Compare</button>
 </form>
-{% if notice %}
+{% if jobs %}
+<ul>
+  {% for job in jobs %}
+  <li>
+    <time>{{ job.stamp() }}</time>
+    {% if job.status == "done" %}
+    <a href="{{ url_for('index', user=job.wiki_username) }}"
+      >{{ job.wiki_username }}</a
+    >
+    {% else %} {{ job.wiki_username }} {% endif %} - {{ job.status }}{% if
+    job.useful_count is not none %} ({{ job.useful_count }} useful edits){%
+    endif %}{% if job.error %} {{ job.error }}{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %} {% if notice %}
 <p>{{ notice }}</p>
 {% endif %} {% if rows %} {% include "filters.html" %}
 <form

@@ -4,6 +4,9 @@ import json
 import os
 import secrets
 import tempfile
+import threading
+import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +39,7 @@ from identity import (
     normalize_username,
     parse_timestamp,
 )
-from models import AppUser, LogEntry, Tag, TagMember, WikiProfile, db
+from models import AppUser, LogEntry, LookupJob, Tag, TagMember, WikiProfile, db
 from scripts.collect_good_diffs import collect_user, included_namespaces, load_env
 
 ROOT = Path(__file__).resolve().parent
@@ -143,6 +146,8 @@ def create_app(
     with app.app_context():
         db.create_all()
         _ensure_tag_notes()
+        if os.environ.get("GONEFISHING_NO_JOBS") != "1":
+            _start_lookup_worker(app)
         if init_heavy:
             _load_services(app, env, root)
 
@@ -205,28 +210,59 @@ def create_app(
         subject = normalize_username(request.args.get("user", ""))
         rows: list[ViewRow] = []
         notice = ""
+        active = None
         if subject:
-            if not _services()["store"].has_user(subject):
+            active = (
+                LookupJob.query.filter(
+                    LookupJob.wiki_username == subject,
+                    LookupJob.status.in_(("queued", "running")),
+                )
+                .order_by(LookupJob.id.desc())
+                .first()
+            )
+            if active is not None:
+                running = LookupJob.query.filter_by(status="running").first()
+                if active.status == "running":
+                    notice = f"Comparing {subject} now. Other pages stay available."
+                elif running is not None and running.id != active.id:
+                    notice = (
+                        f"A comparison of {running.wiki_username} is already running. "
+                        f"{subject} is waiting in the queue."
+                    )
+                else:
+                    notice = f"{subject} is waiting in the queue."
+            elif not _services()["store"].has_user(subject):
                 notice = "No usable edits were stored for that account."
             else:
                 rows = _comparison(subject)
                 if not rows:
                     notice = "Nothing to compare."
-        return render_template("index.html", subject=subject, rows=rows, notice=notice)
+        jobs = LookupJob.query.order_by(LookupJob.id.desc()).limit(20).all()
+        return render_template(
+            "index.html", subject=subject, rows=rows, notice=notice, jobs=jobs
+        )
 
     @app.post("/lookup")
     def lookup():
         username = normalize_username(request.form.get("username", ""))
         if not username:
             return redirect(url_for("index"))
-        store = _services()["store"]
         refresh = request.form.get("refresh") == "on"
-        if refresh:
-            WikiProfile.query.filter_by(wiki_username=username).delete()
-        if refresh or not store.has_user(username):
-            _collect(username)
-        _log("lookup", lookup_name=username, useful_count=store.count(username))
-        db.session.commit()
+        existing = LookupJob.query.filter(
+            LookupJob.wiki_username == username,
+            LookupJob.status.in_(("queued", "running")),
+        ).first()
+        if existing is None:
+            db.session.add(
+                LookupJob(
+                    actor_id=_current_actor().id,
+                    wiki_username=username,
+                    refresh=refresh,
+                    status="queued",
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+            db.session.commit()
         return redirect(url_for("index", user=username))
 
     @app.post("/tags")
@@ -533,6 +569,7 @@ def _log(
     useful_count: int | None = None,
     before: str | None = None,
     after: str | None = None,
+    actor: AppUser | None = None,
 ) -> None:
     payload = {"users": users or [], "added_by": added_by or {}}
     if tag is not None:
@@ -542,7 +579,7 @@ def _log(
     if after is not None:
         payload["after"] = after
     entry = LogEntry(
-        actor_id=_current_actor().id,
+        actor_id=(actor or _current_actor()).id,
         action=action,
         tag_id=None if tag is None else tag.id,
         lookup_name=lookup_name,
@@ -552,6 +589,75 @@ def _log(
         created_at=datetime.now(timezone.utc),
     )
     db.session.add(entry)
+
+
+def _start_lookup_worker(app: Flask) -> None:
+    def loop() -> None:
+        with app.app_context():
+            while True:
+                job = (
+                    LookupJob.query.filter_by(status="queued")
+                    .order_by(LookupJob.id)
+                    .first()
+                )
+                if job is None:
+                    db.session.remove()
+                    time.sleep(1)
+                    continue
+                job_id = job.id
+                claimed = LookupJob.query.filter_by(id=job_id, status="queued").update(
+                    {
+                        "status": "running",
+                        "started_at": datetime.now(timezone.utc),
+                    }
+                )
+                db.session.commit()
+                if claimed != 1:
+                    continue
+                try:
+                    _execute_lookup(job_id)
+                except Exception:
+                    db.session.rollback()
+                    failed = db.session.get(LookupJob, job_id)
+                    if failed is not None and failed.status == "running":
+                        failed.status = "error"
+                        failed.error = traceback.format_exc()[-2000:]
+                        failed.finished_at = datetime.now(timezone.utc)
+                        db.session.commit()
+                finally:
+                    db.session.remove()
+
+    with app.app_context():
+        LookupJob.query.filter_by(status="running").update({"status": "queued"})
+        db.session.commit()
+    threading.Thread(target=loop, name="lookup-jobs", daemon=True).start()
+
+
+def _execute_lookup(job_id: int) -> None:
+    job = db.session.get(LookupJob, job_id)
+    if job is None:
+        return
+    username = job.wiki_username
+    refresh = job.refresh
+    actor = db.session.get(AppUser, job.actor_id)
+    store = _services()["store"]
+    if refresh:
+        WikiProfile.query.filter_by(wiki_username=username).delete()
+        db.session.commit()
+    if refresh or not store.has_user(username):
+        kept = _collect(username)
+    else:
+        kept = store.count(username)
+    _comparison(username)
+    _log("lookup", lookup_name=username, useful_count=kept, actor=actor)
+    finished = db.session.get(LookupJob, job_id)
+    if finished is None:
+        db.session.commit()
+        return
+    finished.status = "done"
+    finished.useful_count = kept
+    finished.finished_at = datetime.now(timezone.utc)
+    db.session.commit()
 
 
 def _ensure_tag_notes() -> None:
@@ -570,27 +676,31 @@ def _forget_tag_scores(tag_name: str) -> None:
         store.drop_tag_scores(tag_name)
 
 
+_wiki_lock = threading.Lock()
+
+
 def _collect(username: str) -> int:
     gone = _services()
-    with tempfile.TemporaryDirectory() as directory:
-        dest = Path(directory) / "user.jsonl"
-        kept = collect_user(
-            gone["client"],
-            username,
-            gone["namespaces"],
-            gone["config"],
-            dest,
-            max_useful=MAX_USEFUL,
-            max_scanned=MAX_USEFUL * 10,
-        )
-        loaded = [
-            Document(username, document.revid, document.pageid, document.prose)
-            for docs in load_documents(dest).values()
-            for document in docs
-        ]
-    if loaded:
-        gone["store"].replace_user(loaded)
-    return kept
+    with _wiki_lock:
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory) / "user.jsonl"
+            kept = collect_user(
+                gone["client"],
+                username,
+                gone["namespaces"],
+                gone["config"],
+                dest,
+                max_useful=MAX_USEFUL,
+                max_scanned=MAX_USEFUL * 10,
+            )
+            loaded = [
+                Document(username, document.revid, document.pageid, document.prose)
+                for docs in load_documents(dest).values()
+                for document in docs
+            ]
+        if loaded:
+            gone["store"].replace_user(loaded)
+        return kept
 
 
 def _ensure_vector(user: str):

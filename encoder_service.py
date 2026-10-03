@@ -61,6 +61,14 @@ def _register(encoder) -> None:
 
 def serve() -> None:
     os.environ.setdefault("PYWIKIBOT_NO_USER_CONFIG", "2")
+    from cpus import compute_cpus
+
+    cores = str(compute_cpus())
+    os.environ["OMP_NUM_THREADS"] = cores
+    os.environ["MKL_NUM_THREADS"] = cores
+    import torch
+
+    torch.set_num_threads(int(cores))
     from authorship.encode import LuarEncoder
     from scripts.collect_good_diffs import load_env
 

@@ -41,10 +41,11 @@ def test_pages_require_login(tmp_path):
         assert response.headers["Location"].endswith("/login")
 
 
-def test_tag_add_remove_and_undo(tmp_path):
+def test_tag_add_remove_and_undo(tmp_path, monkeypatch):
     from factory import create_app
-    from models import AppUser, LogEntry, Tag, TagMember, db
+    from models import AppUser, LogEntry, LookupJob, Tag, TagMember, db
 
+    monkeypatch.setenv("GONEFISHING_NO_JOBS", "1")
     app = create_app(init_heavy=False, db_path=tmp_path / "app.sqlite")
     with app.app_context():
         actor = AppUser(username="MSK")
@@ -60,6 +61,14 @@ def test_tag_add_remove_and_undo(tmp_path):
     home = client.get("/")
     assert home.status_code == 200
     assert b"Wikipedia username" in home.data
+
+    queued = client.post("/lookup", data={"csrf": "token", "username": "Lionsonny"})
+    assert queued.status_code == 302
+    again = client.post("/lookup", data={"csrf": "token", "username": "Darrenchant"})
+    assert again.status_code == 302
+    with app.app_context():
+        names = [job.wiki_username for job in LookupJob.query.order_by(LookupJob.id)]
+        assert names == ["Lionsonny", "Darrenchant"]
 
     added = client.post(
         "/tags",
@@ -190,5 +199,20 @@ def test_on_tf_keeps_the_database_under_home(tmp_path, monkeypatch):
     assert database.as_posix() in app.config["SQLALCHEMY_DATABASE_URI"]
 
 
+def test_cpu_quota_rounds_to_cores():
+    from cpus import cpus_from_quota
+
+    assert cpus_from_quota("max 100000") is None
+    assert cpus_from_quota("200000 100000") == 2
+    assert cpus_from_quota("50000 100000") == 1
+
+
+def test_one_core_stays_free_for_the_site():
+    from cpus import compute_cpus, provisioned_cpus
+
+    assert compute_cpus() == max(1, provisioned_cpus() - 1)
+
+
 def test_normalize_username():
+    assert normalize_username(" User_Tamzin ") == "User Tamzin"
     assert normalize_username(" User_Tamzin ") == "User Tamzin"

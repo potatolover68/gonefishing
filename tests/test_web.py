@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from authorship.lookup import centroid_distances
+from authorship.lookup import centroid_distances, tag_similarity
 
 from identity import (
     account_stats,
@@ -33,6 +33,52 @@ def test_account_stats_include_age_and_useful_count():
         account_stats(15234, "2019-03-05T00:00:00Z", 42, now)
         == "15234 (5 March 2019, 7 years, 42 useful)"
     )
+
+
+def test_tag_similarity_drops_the_excluded_member():
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    same = np.array([2.0, 0.0], dtype=np.float32)
+    other = np.array([0.0, 2.0], dtype=np.float32)
+    assert tag_similarity(query, [other], [2]) == 0
+    assert tag_similarity(query, [same, other], [2, 2]) > 0.5
+
+
+def test_adding_accounts_to_a_tag_is_queued(tmp_path, monkeypatch):
+    from factory import create_app
+    from models import AppUser, LookupJob, db
+
+    monkeypatch.setenv("GONEFISHING_NO_JOBS", "1")
+    monkeypatch.setattr("factory._forget_tag_scores", lambda name: None)
+    app = create_app(init_heavy=False, db_path=tmp_path / "app.sqlite")
+    with app.app_context():
+        actor = AppUser(username="MSK")
+        db.session.add(actor)
+        db.session.commit()
+        actor_id = actor.id
+    client = app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = actor_id
+        sess["username"] = "MSK"
+        sess["csrf"] = "token"
+
+    first = client.post(
+        "/tags",
+        data={"csrf": "token", "tag": "Expertwikiguy", "account": ["Lionsonny"]},
+    )
+    assert first.status_code == 302
+    second = client.post(
+        "/tags",
+        data={"csrf": "token", "tag": "Expertwikiguy", "account": ["Darrenchant"]},
+    )
+    assert second.status_code == 302
+    with app.app_context():
+        jobs = LookupJob.query.filter_by(kind="tag").all()
+        assert len(jobs) == 1
+        assert jobs[0].tag_name == "Expertwikiguy"
+        assert jobs[0].status == "queued"
+    page = client.get("/")
+    assert b"Expertwikiguy" in page.data
+    assert b"tag update - queued" in page.data
 
 
 def test_centroid_distance_is_zero_for_the_same_vector():

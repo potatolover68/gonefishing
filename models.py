@@ -39,6 +39,8 @@ class LookupJob(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     actor_id = db.Column(db.Integer, db.ForeignKey("app_users.id"), nullable=False)
     wiki_username = db.Column(db.String(255), nullable=False)
+    kind = db.Column(db.String(16), nullable=False, default="lookup")
+    tag_name = db.Column(db.String(255), nullable=False, default="")
     refresh = db.Column(db.Boolean, nullable=False, default=False)
     status = db.Column(db.String(16), nullable=False, default="queued")
     useful_count = db.Column(db.Integer, nullable=True)

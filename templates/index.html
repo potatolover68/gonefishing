@@ -17,6 +17,10 @@
   {% for job in jobs %}
   <li>
     <time>{{ job.stamp() }}</time>
+    {% if job.kind == "tag" %}
+    <a href="{{ url_for('tag_page', name=job.tag_name) }}">{{ job.tag_name }}</a>
+    tag update - {{ job.status }}{% if job.error %} {{ job.error }}{% endif %}
+    {% else %}
     {% if job.status == "done" %}
     <a href="{{ url_for('index', user=job.wiki_username) }}"
       >{{ job.wiki_username }}</a
@@ -24,6 +28,7 @@
     {% else %} {{ job.wiki_username }} {% endif %} - {{ job.status }}{% if
     job.useful_count is not none %} ({{ job.useful_count }} useful edits){%
     endif %}{% if job.error %} {{ job.error }}{% endif %}
+    {% endif %}
   </li>
   {% endfor %}
 </ul>

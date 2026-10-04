@@ -35,6 +35,11 @@ class AuthorStore:
             "query TEXT NOT NULL, tag TEXT NOT NULL, members TEXT NOT NULL, "
             "score REAL NOT NULL, PRIMARY KEY (query, tag))"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS tag_parts ("
+            "tag TEXT NOT NULL, members TEXT NOT NULL, user TEXT NOT NULL, "
+            "count INTEGER NOT NULL, sum BLOB NOT NULL, PRIMARY KEY (tag, user))"
+        )
         self._conn.commit()
 
     def close(self) -> None:
@@ -143,6 +148,38 @@ class AuthorStore:
 
     def drop_tag_scores(self, tag: str) -> None:
         self._conn.execute("DELETE FROM tag_scores WHERE tag = ?", (tag,))
+        self._conn.execute("DELETE FROM tag_parts WHERE tag = ?", (tag,))
+        self._conn.commit()
+
+    def tag_parts(self, tag: str, members: str) -> dict[str, tuple[np.ndarray, int]] | None:
+        rows = self._conn.execute(
+            "SELECT user, count, sum, members FROM tag_parts WHERE tag = ?", (tag,)
+        ).fetchall()
+        if not rows or any(row[3] != members for row in rows):
+            return None
+        return {
+            row[0]: (np.frombuffer(row[2], dtype=np.float32).copy(), int(row[1]))
+            for row in rows
+        }
+
+    def put_tag_parts(
+        self, tag: str, members: str, parts: dict[str, tuple[np.ndarray, int]]
+    ) -> None:
+        self._conn.execute("DELETE FROM tag_parts WHERE tag = ?", (tag,))
+        if parts:
+            self._conn.executemany(
+                "INSERT INTO tag_parts (tag, members, user, count, sum) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        tag,
+                        members,
+                        user,
+                        count,
+                        np.asarray(total, dtype=np.float32).tobytes(),
+                    )
+                    for user, (total, count) in parts.items()
+                ],
+            )
         self._conn.commit()
 
     def _drop_scores(self, user: str) -> None:
@@ -154,6 +191,26 @@ class AuthorStore:
             "DELETE FROM tag_scores WHERE query = ? OR instr(members, ?) > 0",
             (user, needle),
         )
+        self._conn.execute(
+            "DELETE FROM tag_parts WHERE user = ? OR instr(members, ?) > 0",
+            (user, needle),
+        )
+
+
+def tag_similarity(
+    query: np.ndarray, sums: list[np.ndarray], counts: list[int]
+) -> float | None:
+    total = None
+    count = 0
+    for vector, size in zip(sums, counts):
+        if size <= 0:
+            continue
+        piece = np.asarray(vector, dtype=np.float64)
+        total = piece if total is None else total + piece
+        count += size
+    if total is None or count <= 0:
+        return None
+    return float(np.dot(l2_normalize(np.asarray(query, dtype=np.float64)), l2_normalize(total)))
 
 
 def centroid_distances(vectors: dict[str, np.ndarray]) -> dict[str, float]:

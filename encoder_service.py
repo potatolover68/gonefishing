@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parent
 class _EncoderProxy:
     def embed_episode(self, texts: list[str]) -> np.ndarray: ...
 
+    def embed_many(self, episodes: list[list[str]]) -> np.ndarray: ...
+
 
 class _EncoderManager(BaseManager):
     # BaseManager.register() installs this method at runtime. The body is only
@@ -52,6 +54,9 @@ class RemoteLuarEncoder:
     def embed_episode(self, texts) -> np.ndarray:
         return np.asarray(self._encoder.embed_episode(list(texts)))
 
+    def embed_many(self, episodes) -> np.ndarray:
+        return np.asarray(self._encoder.embed_many(list(episodes)))
+
 
 def _register(encoder) -> None:
     global _registered
@@ -85,6 +90,10 @@ def serve() -> None:
         def embed_episode(self, texts):
             with lock:
                 return inner.embed_episode(texts)
+
+        def embed_many(self, episodes):
+            with lock:
+                return inner.embed_many(episodes)
 
     encoder = _Locked()
     _register(encoder)

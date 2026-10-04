@@ -27,7 +27,7 @@ from flask import (
 )
 
 from authorship.corpus import Document, load_documents
-from authorship.lookup import AuthorStore, centroid_distances
+from authorship.lookup import AuthorStore, centroid_distances, tag_similarity
 from diffproc.config import GroupThresholds, PipelineConfig
 from diffproc.fetch import RevisionCache, WikiClient
 from identity import (
@@ -153,6 +153,7 @@ def create_app(
     with app.app_context():
         db.create_all()
         _ensure_tag_notes()
+        _ensure_lookup_jobs()
         if os.environ.get("GONEFISHING_NO_JOBS") != "1":
             _start_lookup_worker(app)
         if init_heavy:
@@ -232,10 +233,7 @@ def create_app(
                 if active.status == "running":
                     notice = f"Comparing {subject}."
                 elif running is not None and running.id != active.id:
-                    notice = (
-                        f"A comparison of {running.wiki_username} is already running. "
-                        f"{subject} is waiting in the queue."
-                    )
+                    notice = _busy_notice(running, subject)
                 else:
                     notice = f"{subject} is waiting in the queue."
             elif not _services()["store"].has_user(subject):
@@ -314,6 +312,7 @@ def create_app(
                     added_by={name: actor.username for name in added},
                 )
                 _forget_tag_scores(tag.name)
+                _enqueue_tag_job(tag.name)
             db.session.commit()
         return redirect(url_for("index", user=subject) if subject else url_for("index"))
 
@@ -406,6 +405,7 @@ def create_app(
                 db.session.delete(member)
             _log("tag_remove", tag=tag, users=users, added_by=added_by)
             _forget_tag_scores(tag.name)
+            _enqueue_tag_job(tag.name)
             db.session.commit()
         return redirect(url_for("tag_page", name=tag.name))
 
@@ -456,6 +456,7 @@ def create_app(
                 restored.append(name)
             _log("undo_remove", tag=tag, users=restored or users, added_by=adders)
         _forget_tag_scores(tag.name)
+        _enqueue_tag_job(tag.name)
         entry.undone = True
         db.session.commit()
         return redirect(url_for("log"))
@@ -625,6 +626,7 @@ def _start_lookup_worker(app: Flask) -> None:
                     time.sleep(1)
                     continue
                 job_id = job.id
+                kind = job.kind or "lookup"
                 claimed = LookupJob.query.filter_by(id=job_id, status="queued").update(
                     {
                         "status": "running",
@@ -635,7 +637,10 @@ def _start_lookup_worker(app: Flask) -> None:
                 if claimed != 1:
                     continue
                 try:
-                    _execute_lookup(job_id)
+                    if kind == "tag":
+                        _execute_tag(job_id)
+                    else:
+                        _execute_lookup(job_id)
                 except Exception:
                     db.session.rollback()
                     failed = db.session.get(LookupJob, job_id)
@@ -668,7 +673,7 @@ def _execute_lookup(job_id: int) -> None:
         kept = _collect(username)
     else:
         kept = store.count(username)
-    _comparison(username)
+    _comparison(username, embed_tags=True)
     _log("lookup", lookup_name=username, useful_count=kept, actor=actor)
     finished = db.session.get(LookupJob, job_id)
     if finished is None:
@@ -680,6 +685,75 @@ def _execute_lookup(job_id: int) -> None:
     db.session.commit()
 
 
+def _busy_notice(running: LookupJob, subject: str) -> str:
+    if running.kind == "tag":
+        busy = f"An update of the tag {running.tag_name}"
+    else:
+        busy = f"A comparison of {running.wiki_username}"
+    return f"{busy} is already running. {subject} is waiting in the queue."
+
+
+def _enqueue_tag_job(tag_name: str, actor_id: int | None = None) -> None:
+    queued = LookupJob.query.filter_by(
+        kind="tag", tag_name=tag_name, status="queued"
+    ).first()
+    if queued is not None:
+        return
+    db.session.add(
+        LookupJob(
+            actor_id=actor_id if actor_id is not None else _current_actor().id,
+            wiki_username="",
+            kind="tag",
+            tag_name=tag_name,
+            refresh=False,
+            status="queued",
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+
+
+def _execute_tag(job_id: int) -> None:
+    job = db.session.get(LookupJob, job_id)
+    if job is None:
+        return
+    _rebuild_tag(job.tag_name)
+    finished = db.session.get(LookupJob, job_id)
+    if finished is None:
+        db.session.commit()
+        return
+    finished.status = "done"
+    finished.finished_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+
+def _rebuild_tag(tag_name: str) -> None:
+    gone = _services()
+    store: AuthorStore = gone["store"]
+    tag = Tag.query.filter_by(name=tag_name).one_or_none()
+    if tag is None:
+        store.drop_tag_scores(tag_name)
+        return
+    members = [
+        member.wiki_username
+        for member in TagMember.query.filter_by(tag_id=tag.id)
+    ]
+    members_key = _member_key(members)
+    parts: dict[str, tuple[np.ndarray, int]] = {}
+    for member in members:
+        prose = store.prose(member)
+        if not prose:
+            continue
+        vectors = gone["encoder"].embed_many([[text] for text in prose])
+        parts[member] = (np.asarray(vectors, dtype=np.float64).sum(axis=0), len(prose))
+    current = [
+        member.wiki_username
+        for member in TagMember.query.filter_by(tag_id=tag.id)
+    ]
+    if _member_key(current) != members_key:
+        return
+    store.put_tag_parts(tag_name, members_key, parts)
+
+
 def _ensure_tag_notes() -> None:
     rows = db.session.execute(db.text("PRAGMA table_info(tags)")).fetchall()
     names = {row[1] for row in rows}
@@ -688,6 +762,26 @@ def _ensure_tag_notes() -> None:
             db.text("ALTER TABLE tags ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
         )
         db.session.commit()
+
+
+def _ensure_lookup_jobs() -> None:
+    rows = db.session.execute(db.text("PRAGMA table_info(lookup_jobs)")).fetchall()
+    names = {row[1] for row in rows}
+    if not rows:
+        return
+    if "kind" not in names:
+        db.session.execute(
+            db.text(
+                "ALTER TABLE lookup_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'lookup'"
+            )
+        )
+    if "tag_name" not in names:
+        db.session.execute(
+            db.text(
+                "ALTER TABLE lookup_jobs ADD COLUMN tag_name TEXT NOT NULL DEFAULT ''"
+            )
+        )
+    db.session.commit()
 
 
 def _forget_tag_scores(tag_name: str) -> None:
@@ -850,7 +944,7 @@ def _member_key(names: list[str]) -> str:
     return "\n" + "\n".join(sorted(names, key=str.casefold)) + "\n"
 
 
-def _comparison(subject: str) -> list[ViewRow]:
+def _comparison(subject: str, embed_tags: bool = False) -> list[ViewRow]:
     gone = _services()
     store: AuthorStore = gone["store"]
     query_vector = _ensure_vector(subject)
@@ -876,20 +970,39 @@ def _comparison(subject: str) -> list[ViewRow]:
         members = [
             member.wiki_username
             for member in TagMember.query.filter_by(tag_id=tag.id)
-            if name_key(member.wiki_username) != subject_key
         ]
         if not members:
             continue
         members_key = _member_key(members)
-        cached = store.tag_score(subject, tag.name, members_key)
-        if cached is None:
-            prose: list[str] = []
-            for member in members:
-                prose.extend(store.prose(member))
-            if not prose:
+        excluded = [
+            member for member in members if name_key(member) != subject_key
+        ]
+        cached = (
+            store.tag_score(subject, tag.name, _member_key(excluded))
+            if excluded
+            else None
+        )
+        parts = store.tag_parts(tag.name, members_key)
+        if parts is None and cached is None and embed_tags:
+            _rebuild_tag(tag.name)
+            parts = store.tag_parts(tag.name, members_key)
+        if parts is not None:
+            sums = []
+            counts = []
+            for member, (total, count) in parts.items():
+                if name_key(member) == subject_key:
+                    continue
+                sums.append(total)
+                counts.append(count)
+            score = tag_similarity(query_vector, sums, counts)
+            if score is None:
                 continue
-            cached = float(np.dot(query_vector, gone["encoder"].embed_episode(prose)))
-            store.put_tag_score(subject, tag.name, members_key, cached)
+            rows.append(ViewRow(kind="tag", name=tag.name, similarity=score))
+            continue
+        if cached is None:
+            if not embed_tags and excluded:
+                rows.append(ViewRow(kind="tag", name=tag.name, similarity=None))
+            continue
         rows.append(ViewRow(kind="tag", name=tag.name, similarity=cached))
     rows.sort(
         key=lambda row: row.similarity if row.similarity is not None else -1,

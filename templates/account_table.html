@@ -1,65 +1,68 @@
-<table style="width: 100%">
-  <thead>
-    <tr>
-      <th></th>
-      <th>Account</th>
-      <th>edit count</th>
-      <th>block info</th>
-      <th>tags</th>
-      {% if show_similarity %}
-      <th>similarity</th>
-      {% endif %}
-    </tr>
-  </thead>
-  <tbody id="main-rows">
-    {% for row in rows %}
-    <tr
-      data-kind="{{ row.kind }}"
-      data-account="{{ row.name }}"
-      data-block="{{ row.block }}"
-      data-edits="{{ row.edits if row.edits is not none else '' }}"
-      data-created="{{ row.created }}"
-      data-blocked="{{ '1' if row.blocked else '0' }}"
-    >
-      <td>
-        {% if row.kind == "person" %}<input
-          type="checkbox"
-          name="account"
-          value="{{ row.name }}"
-        />{% endif %}
-      </td>
-      <td>
-        {% if row.kind == "tag" %}
-        <a class="tag" href="{{ url_for('tag_page', name=row.name) }}"
-          >{{ row.name }}</a
-        >
-        {% else %} {{ row.name }} (<a href="{{ row.talk }}">talk</a> |
-        <a href="{{ row.contribs }}">contribs</a> |
-        <a href="{{ row.centralauth }}">centralauth</a> |
-        <a href="{{ row.blocklog }}">block log</a>) {% endif %}
-      </td>
-      <td>{{ row.stats | safe }}</td>
-      <td>{{ row.block }}</td>
-      <td>
-        {% for tag_name, adder in row.tags %}
-        <a
-          class="tag"
-          href="{{ url_for('tag_page', name=tag_name) }}"
-          title="Added by {{ adder }}"
-          >{{ tag_name }}</a
-        >{% if not loop.last %}, {% endif %} {% endfor %}
-      </td>
-      {% if show_similarity %}
-      <td>
-        {% if row.similarity is not none %}{{ "%.4f"|format(row.similarity) }}{%
-        endif %}
-      </td>
-      {% endif %}
-    </tr>
-    {% endfor %}
-  </tbody>
-  <tbody id="tail-rows"></tbody>
-</table>
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Account</th>
+        <th>edit count</th>
+        <th>block info</th>
+        <th>tags</th>
+        {% if show_similarity %}
+        <th>similarity</th>
+        {% endif %}
+      </tr>
+    </thead>
+    <tbody id="main-rows">
+      {% for row in rows %}
+      <tr
+        data-kind="{{ row.kind }}"
+        data-account="{{ row.name }}"
+        data-block="{{ row.block }}"
+        data-edits="{{ row.edits if row.edits is not none else '' }}"
+        data-created="{{ row.created }}"
+        data-blocked="{{ '1' if row.blocked else '0' }}"
+        data-pin="{{ '1' if row.pinned else '0' }}"
+      >
+        <td>
+          {% if row.kind == "person" %}<input
+            type="checkbox"
+            name="account"
+            value="{{ row.name }}"
+          />{% endif %}
+        </td>
+        <td>
+          {% if row.kind == "tag" %}
+          <a class="tag" href="{{ url_for('tag_page', name=row.name) }}"
+            >{{ row.name }}</a
+          >
+          {% else %} {{ row.name }} (<a href="{{ row.talk }}">talk</a> |
+          <a href="{{ row.contribs }}">contribs</a> |
+          <a href="{{ row.centralauth }}">centralauth</a> |
+          <a href="{{ row.blocklog }}">block log</a>) {% endif %}
+        </td>
+        <td>{{ row.stats | safe }}</td>
+        <td>{{ row.block }}</td>
+        <td>
+          {% for tag_name, adder in row.tags %}
+          <a
+            class="tag"
+            href="{{ url_for('tag_page', name=tag_name) }}"
+            title="Added by {{ adder }}"
+            >{{ tag_name }}</a
+          >{% if not loop.last %}, {% endif %} {% endfor %}
+        </td>
+        {% if show_similarity %}
+        <td>
+          {% if row.similarity is not none %}{{ "%.4f"|format(row.similarity)
+          }}{% endif %}
+        </td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tbody id="tail-rows"></tbody>
+  </table>
+</div>
 <script>
   (function () {
     var query = document.getElementById("q");
@@ -107,7 +110,13 @@
       var rows = Array.prototype.slice
         .call(main.querySelectorAll("tr"))
         .concat(Array.prototype.slice.call(tail.querySelectorAll("tr")));
+      var pinned = [];
+      var rest = [];
       rows.forEach(function (row) {
+        if (row.dataset.pin === "1") pinned.push(row);
+        else rest.push(row);
+      });
+      rest.forEach(function (row) {
         var box = row.querySelector("input[type=checkbox]");
         var selected = box && box.checked;
         if (matches(row)) {
@@ -123,6 +132,11 @@
           row.classList.remove("filtered");
           main.appendChild(row);
         }
+      });
+      pinned.reverse().forEach(function (row) {
+        row.hidden = false;
+        row.classList.remove("filtered");
+        main.insertBefore(row, main.firstChild);
       });
     }
 

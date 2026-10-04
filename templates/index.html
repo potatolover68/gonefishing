@@ -1,9 +1,11 @@
 {% extends "base.html" %} {% block body %}
 <form method="post" action="{{ url_for('lookup') }}">
   <input type="hidden" name="csrf" value="{{ csrf }}" />
-  <label
-    >Wikipedia username <input name="username" value="{{ subject }}"
-  /></label>
+  <input
+    name="username"
+    value="{{ subject }}"
+    placeholder="Wikipedia username"
+  />
   <label
     ><input type="checkbox" name="refresh" /> Collect again if this account is
     already stored</label
@@ -26,7 +28,7 @@
   {% endfor %}
 </ul>
 {% endif %} {% if notice %}
-<p>{{ notice }}</p>
+<p>{{ notice|safe }}</p>
 {% endif %} {% if rows %} {% include "filters.html" %}
 <form
   id="accounts"

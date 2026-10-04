@@ -27,13 +27,14 @@ from flask import (
 )
 
 from authorship.corpus import Document, load_documents
-from authorship.lookup import AuthorStore
+from authorship.lookup import AuthorStore, centroid_distances
 from diffproc.config import GroupThresholds, PipelineConfig
 from diffproc.fetch import RevisionCache, WikiClient
 from identity import (
     account_stats,
     block_text,
     clerk_keys,
+    experienced_editor,
     name_key,
     named_allowed,
     normalize_username,
@@ -45,6 +46,11 @@ from scripts.collect_good_diffs import collect_user, included_namespaces, load_e
 ROOT = Path(__file__).resolve().parent
 MODEL_ID = "rrivera1849/LUAR-MUD"
 MAX_USEFUL = 500
+EXPERIENCED_NOTICE = (
+    "<b>Note:</b> by its very nature, good encyclopedic writing is dispassionate and bland, "
+    "so when comparing experienced editors take the similarity score with an "
+    "extra large grain of salt."
+)
 OPEN_ENDPOINTS = {"login", "login_start", "callback"}
 
 
@@ -63,6 +69,7 @@ class ViewRow:
     contribs: str = ""
     centralauth: str = ""
     blocklog: str = ""
+    pinned: bool = False
 
 
 def wiki_slug(name: str) -> str:
@@ -223,7 +230,7 @@ def create_app(
             if active is not None:
                 running = LookupJob.query.filter_by(status="running").first()
                 if active.status == "running":
-                    notice = f"Comparing {subject} now. Other pages stay available."
+                    notice = f"Comparing {subject}."
                 elif running is not None and running.id != active.id:
                     notice = (
                         f"A comparison of {running.wiki_username} is already running. "
@@ -237,6 +244,12 @@ def create_app(
                 rows = _comparison(subject)
                 if not rows:
                     notice = "Nothing to compare."
+                elif rows[0].pinned and experienced_editor(
+                    rows[0].edits or 0,
+                    rows[0].created,
+                    datetime.now(timezone.utc),
+                ):
+                    notice = EXPERIENCED_NOTICE
         jobs = LookupJob.query.order_by(LookupJob.id.desc()).limit(20).all()
         return render_template(
             "index.html", subject=subject, rows=rows, notice=notice, jobs=jobs
@@ -316,6 +329,13 @@ def create_app(
         )
         names = [member.wiki_username for member in members]
         rows = _person_rows(names, similarities=None)
+        scores = _outlier_scores(names)
+        for row in rows:
+            row.similarity = scores.get(row.name)
+        rows.sort(
+            key=lambda row: row.similarity if row.similarity is not None else -1,
+            reverse=True,
+        )
         return render_template(
             "tag.html", tag=tag, rows=rows, member_count=len(members)
         )
@@ -774,6 +794,18 @@ def _profile_info(row: WikiProfile) -> dict:
     }
 
 
+def _outlier_scores(names: list[str]) -> dict[str, float]:
+    store: AuthorStore | None = current_app.extensions["gone"].get("store")
+    if store is None:
+        return {}
+    vectors: dict[str, np.ndarray] = {}
+    for name in names:
+        vector = store.vector(name)
+        if vector is not None:
+            vectors[name] = vector
+    return centroid_distances(vectors)
+
+
 def _person_rows(
     names: list[str], similarities: dict[str, float] | None
 ) -> list[ViewRow]:
@@ -863,4 +895,7 @@ def _comparison(subject: str) -> list[ViewRow]:
         key=lambda row: row.similarity if row.similarity is not None else -1,
         reverse=True,
     )
+    subject_row = _person_rows([subject], {subject: 1.0})[0]
+    subject_row.pinned = True
+    rows.insert(0, subject_row)
     return rows

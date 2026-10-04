@@ -1,9 +1,14 @@
 from datetime import datetime, timezone
 
+import numpy as np
+
+from authorship.lookup import centroid_distances
+
 from identity import (
     account_stats,
     age_phrase,
     clerk_keys,
+    experienced_editor,
     named_allowed,
     normalize_username,
 )
@@ -28,6 +33,25 @@ def test_account_stats_include_age_and_useful_count():
         account_stats(15234, "2019-03-05T00:00:00Z", 42, now)
         == "15234 (5 March 2019, 7 years, 42 useful)"
     )
+
+
+def test_centroid_distance_is_zero_for_the_same_vector():
+    same = np.array([1.0, 0.0], dtype=np.float32)
+    other = np.array([0.0, 1.0], dtype=np.float32)
+    scores = centroid_distances({"same": same, "other": other})
+    assert scores["same"] == scores["other"]
+    assert scores["same"] > 0
+    alone = centroid_distances({"same": same, "copy": same})
+    assert alone["same"] == 1.0
+    assert alone["copy"] == 1.0
+
+
+def test_experienced_editor_needs_many_edits_and_six_months():
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    assert experienced_editor(1001, "2026-04-03T00:00:00Z", now)
+    assert not experienced_editor(1000, "2020-01-01T00:00:00Z", now)
+    assert not experienced_editor(5000, "2026-04-07T00:00:00Z", now)
+    assert not experienced_editor(5000, "", now)
 
 
 def test_pages_require_login(tmp_path):

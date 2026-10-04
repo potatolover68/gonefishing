@@ -6,6 +6,7 @@
       href="{{ url_for('static', filename='normalize.css') }}"
     />
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>🎣{% block title %}gone fishing{% endblock %}</title>
     <style>
       a.tag {
@@ -14,26 +15,42 @@
       a.tag:hover {
         text-decoration: underline solid;
       }
+      #main-rows tr:nth-child(even of :not([hidden])) {
+        background-color: #5552;
+      }
       tr.filtered {
         background: #ccc;
       }
-      tbody tr:nth-child(even) {
-        background-color: #5552;
-      }
       button:disabled {
         color: gray;
+      }
+      body {
+        margin: 8px;
       }
       #nav {
         position: absolute;
         top: 8px;
         right: calc(8px + 0.25em);
       }
+      @media (max-width: 48rem) {
+        #nav {
+          position: static;
+          margin-bottom: 1em;
+        }
+      }
       #nav > *:not(:last-child, #logout-form)::after {
         content: "|";
         margin: 0 0.25em;
       }
-      body {
-        margin: 8px;
+      .table-scroll {
+        overflow-x: auto;
+      }
+      .table-scroll table {
+        width: 100%;
+        min-width: 48rem;
+      }
+      * {
+        font-family: "Times New Roman", serif;
       }
     </style>
   </head>
@@ -49,6 +66,11 @@
     </form>
     <nav id="nav">
       <span>🎣</span>
+      <a
+        href="https://github.com/potatolover68/gonefishing/wiki/Getting-started"
+        target="_blank"
+        >Getting started</a
+      >
       <a href="{{ url_for('index') }}">Lookup</a>
       <a href="{{ url_for('tags') }}">Tags</a>
       <a href="{{ url_for('log') }}">Log</a>

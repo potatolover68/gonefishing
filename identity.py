@@ -44,6 +44,15 @@ def format_day(moment: datetime) -> str:
     return f"{moment.day} {moment.strftime('%B')} {moment.year}"
 
 
+def experienced_editor(editcount: int, registration: str, now: datetime) -> bool:
+    if editcount <= 1000:
+        return False
+    registered = parse_timestamp(registration)
+    if registered is None:
+        return False
+    return (now.date() - registered.date()).days > 180
+
+
 def age_phrase(registered: datetime, now: datetime) -> str:
     days = (now.date() - registered.date()).days
     if days >= 365:

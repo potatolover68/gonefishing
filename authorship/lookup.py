@@ -41,7 +41,9 @@ class AuthorStore:
         self._conn.close()
 
     def users(self) -> list[str]:
-        rows = self._conn.execute("SELECT DISTINCT user FROM documents ORDER BY user").fetchall()
+        rows = self._conn.execute(
+            "SELECT DISTINCT user FROM documents ORDER BY user"
+        ).fetchall()
         return [row[0] for row in rows]
 
     def has_user(self, user: str) -> bool:
@@ -76,7 +78,10 @@ class AuthorStore:
         self._conn.execute("DELETE FROM vectors WHERE user = ?", (user,))
         self._conn.executemany(
             "INSERT OR REPLACE INTO documents (user, revid, pageid, prose) VALUES (?, ?, ?, ?)",
-            [(document.user, document.revid, document.pageid, document.prose) for document in documents],
+            [
+                (document.user, document.revid, document.pageid, document.prose)
+                for document in documents
+            ],
         )
         self._conn.commit()
 
@@ -90,7 +95,9 @@ class AuthorStore:
         return added
 
     def vector(self, user: str) -> np.ndarray | None:
-        row = self._conn.execute("SELECT vector FROM vectors WHERE user = ?", (user,)).fetchone()
+        row = self._conn.execute(
+            "SELECT vector FROM vectors WHERE user = ?", (user,)
+        ).fetchone()
         if row is None:
             return None
         return np.frombuffer(row[0], dtype=np.float32).copy()
@@ -149,7 +156,18 @@ class AuthorStore:
         )
 
 
-def rank_authors(query: str, vectors: dict[str, np.ndarray], query_vector: np.ndarray) -> list[tuple[str, float]]:
+def centroid_distances(vectors: dict[str, np.ndarray]) -> dict[str, float]:
+    if not vectors:
+        return {}
+    names = list(vectors)
+    stacked = np.vstack([np.asarray(vectors[name], dtype=np.float32) for name in names])
+    centroid = l2_normalize(stacked.mean(axis=0))
+    return {name: float(dot) for name, dot in zip(names, stacked @ centroid)}
+
+
+def rank_authors(
+    query: str, vectors: dict[str, np.ndarray], query_vector: np.ndarray
+) -> list[tuple[str, float]]:
     scored = [
         (user, float(np.dot(query_vector, vector)))
         for user, vector in vectors.items()

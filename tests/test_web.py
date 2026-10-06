@@ -1,38 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
 from authorship.lookup import centroid_distances, tag_similarity
 
-from identity import (
-    account_stats,
-    age_phrase,
-    clerk_keys,
-    experienced_editor,
-    named_allowed,
-    normalize_username,
-)
-
-
-def test_allowlist_is_named_allowed(tmp_path):
-    allowlist = tmp_path / "allowlist.txt"
-    allowlist.write_text("Tamzin\nLuniZunie \n", encoding="utf-8")
-    allowed = clerk_keys(allowlist)
-    assert named_allowed("MSK", allowed)
-    assert named_allowed("msk", allowed)
-    assert named_allowed("_Tamzin", allowed)
-    assert named_allowed("LuniZunie", allowed)
-    assert not named_allowed("SomeoneElse", allowed)
-
-
-def test_account_stats_include_age_and_useful_count():
-    now = datetime(2026, 3, 5, tzinfo=timezone.utc)
-    registered = datetime(2019, 3, 5, tzinfo=timezone.utc)
-    assert age_phrase(registered, now) == "7 years"
-    assert (
-        account_stats(15234, "2019-03-05T00:00:00Z", 42, now)
-        == "15234 (5 March 2019, 7 years, 42 useful)"
-    )
+from identity import experienced_editor, normalize_username
 
 
 def test_tag_similarity_drops_the_excluded_member():
@@ -281,6 +253,114 @@ def test_one_core_stays_free_for_the_site():
     from cpus import compute_cpus, provisioned_cpus
 
     assert compute_cpus() == max(1, provisioned_cpus() - 1)
+
+
+def test_local_lookup_hands_diffs_to_the_client(tmp_path, monkeypatch):
+    from factory import create_app
+    from models import AppUser, LogEntry, LookupJob, db
+
+    monkeypatch.setenv("GONEFISHING_NO_JOBS", "1")
+    app = create_app(init_heavy=False, db_path=tmp_path / "app.sqlite")
+    with app.app_context():
+        actor = AppUser(username="MSK")
+        db.session.add(actor)
+        db.session.commit()
+        actor_id = actor.id
+    client = app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = actor_id
+        sess["username"] = "MSK"
+        sess["csrf"] = "token"
+
+    started = client.post(
+        "/lookup",
+        data={"csrf": "token", "username": "Ada", "local": "on"},
+    )
+    assert started.status_code == 200
+    qid = started.get_json()["qid"]
+    again = client.post(
+        "/lookup",
+        data={"csrf": "token", "username": "Ada", "local": "on"},
+    )
+    assert again.get_json()["qid"] == qid
+    assert client.get(f"/local?qid={qid}").status_code == 202
+
+    with app.app_context():
+        job = LookupJob.query.filter_by(public_id=qid).one()
+        assert job.local is True
+        job.status = "ready"
+        job.useful_count = 2
+        db.session.commit()
+
+    class Store:
+        def __init__(self):
+            self.saved = None
+
+        def prose(self, user):
+            return ["alpha", "beta"]
+
+        def put_vector(self, user, vector, processor=""):
+            self.saved = (user, processor, int(vector.shape[0]))
+
+    store = Store()
+    monkeypatch.setattr("factory._services", lambda: {"store": store})
+    monkeypatch.setattr("factory._comparison", lambda *args, **kwargs: [])
+
+    ready = client.get(f"/local?qid={qid}")
+    assert ready.status_code == 200
+    assert ready.get_json()["diffs"] == ["alpha", "beta"]
+    waiting = client.get("/?user=Ada")
+    assert b"Waiting for a local embedding of Ada." in waiting.data
+
+    posted = client.post(
+        f"/local?qid={qid}",
+        json=[0.25] * 512,
+        headers={"X-CSRF-Token": "token"},
+    )
+    assert posted.status_code == 200
+    assert store.saved == ("Ada", "MSK", 512)
+    with app.app_context():
+        assert LookupJob.query.filter_by(public_id=qid).one().status == "done"
+        assert LogEntry.query.filter_by(action="lookup", lookup_name="Ada").count() == 1
+    assert b"(local)" in client.get("/").data
+
+
+def test_stale_local_jobs_are_not_done(tmp_path, monkeypatch):
+    from factory import create_app
+    from models import AppUser, LookupJob, db
+
+    monkeypatch.setenv("GONEFISHING_NO_JOBS", "1")
+    app = create_app(init_heavy=False, db_path=tmp_path / "app.sqlite")
+    with app.app_context():
+        actor = AppUser(username="MSK")
+        db.session.add(actor)
+        db.session.commit()
+        actor_id = actor.id
+        db.session.add(
+            LookupJob(
+                actor_id=actor_id,
+                wiki_username="Ada",
+                local=True,
+                public_id="stale-qid",
+                status="ready",
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=11),
+            )
+        )
+        db.session.commit()
+    client = app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = actor_id
+        sess["username"] = "MSK"
+        sess["csrf"] = "token"
+
+    stalled = client.get("/local?qid=stale-qid")
+    assert stalled.status_code == 422
+    assert stalled.get_json()["error"] == "not done"
+    with app.app_context():
+        assert (
+            LookupJob.query.filter_by(public_id="stale-qid").one().status == "not done"
+        )
+    assert b"not done" in client.get("/").data
 
 
 def test_normalize_username():

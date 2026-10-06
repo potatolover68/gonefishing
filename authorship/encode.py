@@ -2,39 +2,44 @@
 
 import os
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
-import torch
+from tokenizers import Tokenizer
 
 from authorship.lookup import l2_normalize
+from cpus import compute_cpus
 
 TOKEN_LENGTH = 128
 GALLERY_CHUNK = 16
 
 
+def luar_onnx_path(root: Path) -> Path:
+    if os.environ.get("ON_TF"):
+        home = os.environ.get("TOOL_DATA_DIR") or os.environ.get("HOME")
+        if not home:
+            raise RuntimeError("ON_TF is set but HOME is not")
+        return Path(home) / "gonefishing" / "luar_mud.onnx"
+    return root / "data" / "luar_mud.onnx"
+
+
 class LuarEncoder:
-    def __init__(
-        self,
-        model_id: str,
-        device: str | None = None,
-        adapter: str | None = None,
-        token: str | None = None,
-    ) -> None:
-        from transformers import AutoModel, AutoTokenizer
+    def __init__(self, onnx_path: Path, tokenizer_path: Path) -> None:
+        import onnxruntime as ort
 
-        if token:
-            os.environ["HF_TOKEN"] = token
-        hub = {"token": token} if token else {}
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        tokenizer_id = adapter or model_id
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True, **hub)
-        self.model = AutoModel.from_pretrained(model_id, trust_remote_code=True, **hub)
-        if adapter:
-            from peft import PeftModel
-
-            self.model = PeftModel.from_pretrained(self.model, adapter, **hub)
-        self.model.to(self.device)
-        self.model.eval()
+        path = Path(onnx_path)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"LUAR ONNX file not found at {path}. "
+                "Run scripts/export_onnx.py and copy the file there."
+            )
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = compute_cpus()
+        options.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            str(path), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        self._tokenizer = Tokenizer.from_file(str(tokenizer_path))
 
     def embed_episode(self, texts: Sequence[str]) -> np.ndarray:
         if not texts:
@@ -60,23 +65,12 @@ class LuarEncoder:
         if any(len(episode) != length for episode in episodes):
             raise ValueError("LUAR episodes in one forward must share a length")
         flat = [text for episode in episodes for text in episode]
-        encoded = self.tokenizer(
-            flat,
-            max_length=TOKEN_LENGTH,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        encoded = {
-            key: value.view(len(episodes), length, -1).to(self.device)
-            for key, value in encoded.items()
-            if key in {"input_ids", "attention_mask"}
-        }
-        with torch.inference_mode():
-            with torch.autocast(device_type=self.device.split(":")[0], enabled=self.device.startswith("cuda")):
-                output = self.model(
-                    input_ids=encoded["input_ids"],
-                    attention_mask=encoded["attention_mask"],
-                    document_batch_size=32,
-                )
-        return output.float().cpu().numpy()
+        encoded = self._tokenizer.encode_batch(flat)
+        ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
+        mask = np.asarray([item.attention_mask for item in encoded], dtype=np.int64)
+        ids = ids.reshape(len(episodes), length, TOKEN_LENGTH)
+        mask = mask.reshape(len(episodes), length, TOKEN_LENGTH)
+        output = self._session.run(
+            None, {"input_ids": ids, "attention_mask": mask}
+        )[0]
+        return np.asarray(output, dtype=np.float32)

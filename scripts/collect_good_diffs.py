@@ -4,7 +4,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from urllib.parse import quote
 
 from dotenv import load_dotenv
 
@@ -13,15 +12,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from diffproc.config import PipelineConfig
-from diffproc.fetch import RevisionCache, WikiClient
+from diffproc.fetch import WikiClient
 from diffproc.namespaces import groups_from_siteinfo, ns_group
 from diffproc.pipeline import process_edit
 from diffproc.sessions import collapse_session, iter_sessions, session_is_large_enough
 
 TARGET = 250
 MAX_CONTRIBS = 2500
-USERS = ROOT / "data" / "autoreviewers.txt"
-OUT = ROOT / "data" / "good_diffs"
 
 
 def load_env(path: Path | None = None) -> dict[str, str]:
@@ -127,45 +124,3 @@ def collect_user(
             flush()
     flush()
     return kept
-
-
-def main() -> None:
-    env = load_env(ROOT / ".env")
-    username = env.get("USER", "")
-    password = env.get("PASS", "")
-    if not username or not password:
-        raise SystemExit("USER and PASS are required in .env")
-    users = [
-        line.strip()
-        for line in USERS.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    OUT.mkdir(parents=True, exist_ok=True)
-    config = PipelineConfig(
-        user_agent="gonefishing/0.1 by en:User:MSK <thewonderfulworldofpotatoes@gmail.com>",
-        is_bot=True,
-    )
-    cache = RevisionCache(ROOT / "data" / "revisions.sqlite")
-    client = WikiClient(config, cache)
-    client.login(username, password)
-    namespaces = included_namespaces(client)
-    print(f"logged in; namespaces={namespaces}; users={len(users)}", flush=True)
-    try:
-        for index, user in enumerate(users, start=1):
-            dest = OUT / f"{quote(user, safe='')}.jsonl"
-            done = Path(str(dest) + ".done")
-            if done.exists():
-                print(f"{index}/{len(users)} skip {user}", flush=True)
-                continue
-            if dest.exists():
-                dest.unlink()
-            kept = collect_user(client, user, namespaces, config, dest)
-            done.write_text(str(kept), encoding="utf-8")
-            print(f"{index}/{len(users)} {user}: {kept}", flush=True)
-    finally:
-        client.close()
-        cache.close()
-
-
-if __name__ == "__main__":
-    main()

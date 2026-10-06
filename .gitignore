@@ -222,6 +222,9 @@ __marimo__/
 # Databases
 *.sqlite
 
+# Exported LUAR weights are too large for git. Copy data/luar_mud.onnx onto the tool data dir.
+*.onnx
+
 # apicache
 /apicache/
 

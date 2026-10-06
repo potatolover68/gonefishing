@@ -71,18 +71,15 @@ def serve() -> None:
     cores = str(compute_cpus())
     os.environ["OMP_NUM_THREADS"] = cores
     os.environ["MKL_NUM_THREADS"] = cores
-    import torch
-
-    torch.set_num_threads(int(cores))
-    from authorship.encode import LuarEncoder
+    from authorship.encode import LuarEncoder, luar_onnx_path
     from scripts.collect_good_diffs import load_env
 
     env_path = ROOT / ".env"
-    env = load_env(env_path) if env_path.exists() else {}
+    if env_path.exists():
+        load_env(env_path)
     inner = LuarEncoder(
-        "rrivera1849/LUAR-MUD",
-        adapter=str(ROOT / "data" / "luar_mud_lora"),
-        token=env.get("HF_TOKEN") or None,
+        luar_onnx_path(ROOT),
+        ROOT / "data" / "luar_mud_lora" / "tokenizer.json",
     )
     lock = threading.Lock()
 

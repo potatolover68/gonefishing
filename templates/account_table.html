@@ -53,8 +53,11 @@
         </td>
         {% if show_similarity %}
         <td>
-          {% if row.similarity is not none %}{{ "%.4f"|format(row.similarity)
-          }}{% endif %}
+          {% if row.similarity is not none %}{% if row.local_by %}<span
+            style="text-decoration: underline dotted"
+            title="Locally processed by {{ row.local_by }}"
+            >{{ "%.4f"|format(row.similarity) }}</span
+          >{% else %}{{ "%.4f"|format(row.similarity) }}{% endif %}{% endif %}
         </td>
         {% endif %}
       </tr>

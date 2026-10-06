@@ -1,5 +1,5 @@
 {% extends "base.html" %} {% block body %}
-<form method="post" action="{{ url_for('lookup') }}">
+<form id="lookup-form" method="post" action="{{ url_for('lookup') }}">
   <input type="hidden" name="csrf" value="{{ csrf }}" />
   <input
     name="username"
@@ -10,7 +10,22 @@
     ><input type="checkbox" name="refresh" /> Collect again if this account is
     already stored</label
   >
+  <label id="local-label" style="color: gray"
+    ><input
+      id="process-locally"
+      type="checkbox"
+      name="local"
+      value="on"
+      disabled
+    />
+    <a
+      href="https://github.com/potatolover68/gonefishing-client"
+      target="_blank"
+      >Process locally?</a
+    ></label
+  >
   <button>Compare</button>
+  <span id="local-status"></span>
 </form>
 {% if jobs %}
 <ul>
@@ -18,17 +33,18 @@
   <li>
     <time>{{ job.stamp() }}</time>
     {% if job.kind == "tag" %}
-    <a href="{{ url_for('tag_page', name=job.tag_name) }}">{{ job.tag_name }}</a>
+    <a href="{{ url_for('tag_page', name=job.tag_name) }}"
+      >{{ job.tag_name }}</a
+    >
     tag update - {{ job.status }}{% if job.error %} {{ job.error }}{% endif %}
-    {% else %}
-    {% if job.status == "done" %}
+    {% else %} {% if job.status == "done" %}
     <a href="{{ url_for('index', user=job.wiki_username) }}"
       >{{ job.wiki_username }}</a
     >
     {% else %} {{ job.wiki_username }} {% endif %} - {{ job.status }}{% if
-    job.useful_count is not none %} ({{ job.useful_count }} useful edits){%
-    endif %}{% if job.error %} {{ job.error }}{% endif %}
-    {% endif %}
+    job.local %} (local){% endif %}{% if job.useful_count is not none %} ({{
+    job.useful_count }} useful edits){% endif %}{% if job.error %} {{ job.error
+    }}{% endif %} {% endif %}
   </li>
   {% endfor %}
 </ul>
@@ -47,4 +63,178 @@
   <button>Add to tag</button>
   {% set show_similarity = true %} {% include "account_table.html" %}
 </form>
-{% endif %} {% endblock %}
+{% endif %}
+<script>
+  (function () {
+    var form = document.getElementById("lookup-form");
+    var box = document.getElementById("process-locally");
+    var label = document.getElementById("local-label");
+    var status = document.getElementById("local-status");
+    var localApp = "http://localhost:11501";
+    if (!form || !box || !label) return;
+
+    function setAvailable(available) {
+      box.disabled = !available;
+      label.style.color = available ? "" : "gray";
+      if (!available) box.checked = false;
+    }
+
+    function probe() {
+      fetch(localApp + "/status", { signal: AbortSignal.timeout(1000) })
+        .then(function (response) {
+          if (!response.ok) throw new Error("down");
+          setAvailable(true);
+        })
+        .catch(function () {
+          setAvailable(false);
+        });
+    }
+
+    var storageKey = "gonefishing-local";
+    var runId = 0;
+
+    function recall() {
+      try {
+        var raw = localStorage.getItem(storageKey);
+        return raw ? JSON.parse(raw) : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function remember(state) {
+      localStorage.setItem(storageKey, JSON.stringify(state));
+    }
+
+    function forget() {
+      localStorage.removeItem(storageKey);
+    }
+
+    function poll(url, delay) {
+      if (delay === undefined) delay = 5000;
+      return fetch(url).then(function (response) {
+        if (response.status === 202) {
+          return new Promise(function (resolve, reject) {
+            setTimeout(function () {
+              poll(url, delay).then(resolve, reject);
+            }, delay);
+          });
+        }
+        return response.json().then(function (body) {
+          if (!response.ok) throw new Error(body.error || response.statusText);
+          return body;
+        });
+      });
+    }
+
+    function saveVector(state, csrf) {
+      return fetch("/local?qid=" + encodeURIComponent(state.serverQid), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrf,
+        },
+        body: JSON.stringify(state.vector),
+      });
+    }
+
+    function run(state) {
+      var id = ++runId;
+      remember(state);
+      var csrf = form.querySelector("[name=csrf]").value;
+      var chain;
+      if (state.vector) {
+        status.textContent = "Saving…";
+        chain = saveVector(state, csrf);
+      } else if (state.localQid) {
+        status.textContent = "Processing locally…";
+        chain = poll(
+          localApp + "/done?qid=" + encodeURIComponent(state.localQid),
+          1000,
+        ).then(function (vector) {
+          if (id !== runId) return;
+          state.vector = vector;
+          remember(state);
+          status.textContent = "Saving…";
+          return saveVector(state, csrf);
+        });
+      } else {
+        status.textContent = "Collecting edits…";
+        chain = poll("/local?qid=" + encodeURIComponent(state.serverQid))
+          .then(function (ready) {
+            if (id !== runId) return;
+            status.textContent = "Processing locally…";
+            return fetch(localApp + "/process", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(ready.diffs),
+            }).then(function (response) {
+              if (!response.ok) throw new Error("local process failed");
+              return response.json();
+            });
+          })
+          .then(function (started) {
+            if (id !== runId || !started) return;
+            state.localQid = started.qid;
+            remember(state);
+            return poll(
+              localApp + "/done?qid=" + encodeURIComponent(state.localQid),
+              1000,
+            );
+          })
+          .then(function (vector) {
+            if (id !== runId || !vector) return;
+            state.vector = vector;
+            remember(state);
+            status.textContent = "Saving…";
+            return saveVector(state, csrf);
+          });
+      }
+      chain
+        .then(function (response) {
+          if (id !== runId || !response) return;
+          if (response.ok || response.status === 409) {
+            forget();
+            window.location = "/?user=" + encodeURIComponent(state.username);
+            return;
+          }
+          throw new Error("could not save the vector");
+        })
+        .catch(function (error) {
+          if (id !== runId) return;
+          if (error.message === "not done") forget();
+          status.textContent = error.message || "local processing failed";
+        });
+    }
+
+    probe();
+    label.addEventListener("mouseenter", probe);
+    box.addEventListener("mouseenter", probe);
+
+    var saved = recall();
+    if (saved && saved.serverQid && saved.username) run(saved);
+
+    form.addEventListener("submit", function (event) {
+      if (!box.checked) return;
+      var username = form.querySelector("[name=username]").value.trim();
+      if (!username) return;
+      event.preventDefault();
+      var id = ++runId;
+      status.textContent = "Queuing…";
+      fetch(form.action, { method: "POST", body: new FormData(form) })
+        .then(function (response) {
+          if (!response.ok) throw new Error("lookup failed");
+          return response.json();
+        })
+        .then(function (queued) {
+          if (id !== runId) return;
+          run({ username: username, serverQid: queued.qid });
+        })
+        .catch(function (error) {
+          if (id !== runId) return;
+          status.textContent = error.message || "local processing failed";
+        });
+    });
+  })();
+</script>
+{% endblock %}

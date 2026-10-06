@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,6 +19,7 @@ from flask import (
     Flask,
     abort,
     current_app,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -27,6 +28,7 @@ from flask import (
 )
 
 from authorship.corpus import Document, load_documents
+from authorship.encode import LuarEncoder, luar_onnx_path
 from authorship.lookup import AuthorStore, centroid_distances, tag_similarity
 from diffproc.config import GroupThresholds, PipelineConfig
 from diffproc.fetch import RevisionCache, WikiClient
@@ -44,8 +46,9 @@ from models import AppUser, LogEntry, LookupJob, Tag, TagMember, WikiProfile, db
 from scripts.collect_good_diffs import collect_user, included_namespaces, load_env
 
 ROOT = Path(__file__).resolve().parent
-MODEL_ID = "rrivera1849/LUAR-MUD"
 MAX_USEFUL = 500
+VECTOR_DIM = 512
+LOCAL_JOB_TTL = timedelta(minutes=10)
 EXPERIENCED_NOTICE = (
     "<b>Note:</b> by its very nature, good encyclopedic writing is dispassionate and bland, "
     "so when comparing experienced editors take the similarity score with an "
@@ -70,6 +73,7 @@ class ViewRow:
     centralauth: str = ""
     blocklog: str = ""
     pinned: bool = False
+    local_by: str = ""
 
 
 def wiki_slug(name: str) -> str:
@@ -165,7 +169,7 @@ def create_app(
 
     @app.before_request
     def guard():
-        if request.method == "POST" and request.form.get("csrf") != session.get("csrf"):
+        if request.method == "POST" and _supplied_csrf() != session.get("csrf"):
             abort(400)
         if request.endpoint in OPEN_ENDPOINTS:
             return None
@@ -215,6 +219,7 @@ def create_app(
 
     @app.get("/")
     def index():
+        _expire_local_jobs()
         subject = normalize_username(request.args.get("user", ""))
         rows: list[ViewRow] = []
         notice = ""
@@ -236,6 +241,8 @@ def create_app(
                     notice = _busy_notice(running, subject)
                 else:
                     notice = f"{subject} is waiting in the queue."
+            elif _local_waiting(subject):
+                notice = f"Waiting for a local embedding of {subject}."
             elif not _services()["store"].has_user(subject):
                 notice = "No usable edits were stored for that account."
             else:
@@ -259,22 +266,80 @@ def create_app(
         if not username:
             return redirect(url_for("index"))
         refresh = request.form.get("refresh") == "on"
+        local = request.form.get("local", "") == "on"
+        if local:
+            inflight = (
+                LookupJob.query.filter(
+                    LookupJob.wiki_username == username,
+                    LookupJob.local.is_(True),
+                    LookupJob.status.in_(("queued", "running", "ready")),
+                )
+                .order_by(LookupJob.id.desc())
+                .first()
+            )
+            if inflight is not None:
+                return jsonify({"qid": inflight.public_id})
         existing = LookupJob.query.filter(
             LookupJob.wiki_username == username,
             LookupJob.status.in_(("queued", "running")),
         ).first()
-        if existing is None:
+        public_id = secrets.token_urlsafe(16) if local else ""
+        if existing is None or local:
             db.session.add(
                 LookupJob(
                     actor_id=_current_actor().id,
                     wiki_username=username,
                     refresh=refresh,
+                    local=local,
+                    public_id=public_id,
                     status="queued",
                     created_at=datetime.now(timezone.utc),
                 )
             )
             db.session.commit()
+        if local:
+            return jsonify({"qid": public_id})
         return redirect(url_for("index", user=username))
+
+    @app.get("/local")
+    def local_diffs():
+        job = _owned_local_job(request.args.get("qid", ""))
+        if job.status in {"queued", "running"}:
+            return jsonify({"status": job.status}), 202
+        if job.status in {"error", "not done"}:
+            return jsonify({"error": job.error or job.status}), 422
+        texts = _services()["store"].prose(job.wiki_username)[:MAX_USEFUL]
+        if not texts:
+            return (
+                jsonify({"error": "No usable edits were stored for that account."}),
+                422,
+            )
+        return jsonify({"user": job.wiki_username, "diffs": texts})
+
+    @app.post("/local")
+    def submit_local():
+        job = _owned_local_job(request.args.get("qid", ""))
+        if job.status != "ready":
+            abort(409)
+        payload = request.get_json(silent=True)
+        vector = _local_vector(payload)
+        if vector is None:
+            abort(400)
+        actor = _current_actor()
+        _services()["store"].put_vector(
+            job.wiki_username, vector, processor=actor.username
+        )
+        _comparison(job.wiki_username, embed_tags=True)
+        _log(
+            "lookup",
+            lookup_name=job.wiki_username,
+            useful_count=job.useful_count,
+            actor=actor,
+        )
+        job.status = "done"
+        job.finished_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return jsonify({"status": "done"})
 
     @app.post("/tags")
     def add_tag():
@@ -515,12 +580,9 @@ def _load_services(app: Flask, env: dict[str, str], root: Path) -> None:
 
         encoder = RemoteLuarEncoder()
     else:
-        from authorship.encode import LuarEncoder
-
         encoder = LuarEncoder(
-            MODEL_ID,
-            adapter=str(root / "data" / "luar_mud_lora"),
-            token=env.get("HF_TOKEN") or None,
+            luar_onnx_path(root),
+            root / "data" / "luar_mud_lora" / "tokenizer.json",
         )
     app.extensions["gone"].update(
         {
@@ -558,6 +620,72 @@ def _actor(username: str) -> AppUser:
     db.session.add(found)
     db.session.commit()
     return found
+
+
+def _aware(moment: datetime) -> datetime:
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def _local_job_is_stale(job: LookupJob) -> bool:
+    if job.created_at is None:
+        return False
+    return _aware(job.created_at) < datetime.now(timezone.utc) - LOCAL_JOB_TTL
+
+
+def _expire_local_jobs() -> None:
+    now = datetime.now(timezone.utc)
+    changed = False
+    jobs = LookupJob.query.filter(
+        LookupJob.local.is_(True),
+        LookupJob.status.in_(("queued", "running", "ready")),
+    ).all()
+    for job in jobs:
+        if not _local_job_is_stale(job):
+            continue
+        job.status = "not done"
+        job.finished_at = now
+        changed = True
+    if changed:
+        db.session.commit()
+
+
+def _supplied_csrf() -> str:
+    return request.form.get("csrf") or request.headers.get("X-CSRF-Token") or ""
+
+
+def _local_waiting(username: str) -> bool:
+    return (
+        LookupJob.query.filter(
+            LookupJob.wiki_username == username,
+            LookupJob.local.is_(True),
+            LookupJob.status == "ready",
+        ).first()
+        is not None
+    )
+
+
+def _owned_local_job(qid: str) -> LookupJob:
+    _expire_local_jobs()
+    job = LookupJob.query.filter_by(public_id=qid, local=True).one_or_none()
+    if job is None or not qid:
+        abort(404)
+    if job.actor_id != _current_actor().id:
+        abort(403)
+    return job
+
+
+def _local_vector(payload: object) -> np.ndarray | None:
+    if not isinstance(payload, list) or len(payload) != VECTOR_DIM:
+        return None
+    try:
+        vector = np.asarray(payload, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if vector.shape != (VECTOR_DIM,) or not np.isfinite(vector).all():
+        return None
+    return vector
 
 
 def _current_actor() -> AppUser:
@@ -616,6 +744,7 @@ def _start_lookup_worker(app: Flask) -> None:
     def loop() -> None:
         with app.app_context():
             while True:
+                _expire_local_jobs()
                 job = (
                     LookupJob.query.filter_by(status="queued")
                     .order_by(LookupJob.id)
@@ -664,6 +793,7 @@ def _execute_lookup(job_id: int) -> None:
         return
     username = job.wiki_username
     refresh = job.refresh
+    local = bool(job.local)
     actor = db.session.get(AppUser, job.actor_id)
     store = _services()["store"]
     if refresh:
@@ -673,6 +803,22 @@ def _execute_lookup(job_id: int) -> None:
         kept = _collect(username)
     else:
         kept = store.count(username)
+    if local:
+        finished = db.session.get(LookupJob, job_id)
+        if finished is None:
+            return
+        if kept <= 0:
+            finished.status = "error"
+            finished.error = "No usable edits were stored for that account."
+            finished.finished_at = datetime.now(timezone.utc)
+        elif _local_job_is_stale(finished):
+            finished.status = "not done"
+            finished.finished_at = datetime.now(timezone.utc)
+        else:
+            finished.status = "ready"
+            finished.useful_count = kept
+        db.session.commit()
+        return
     _comparison(username, embed_tags=True)
     _log("lookup", lookup_name=username, useful_count=kept, actor=actor)
     finished = db.session.get(LookupJob, job_id)
@@ -734,8 +880,7 @@ def _rebuild_tag(tag_name: str) -> None:
         store.drop_tag_scores(tag_name)
         return
     members = [
-        member.wiki_username
-        for member in TagMember.query.filter_by(tag_id=tag.id)
+        member.wiki_username for member in TagMember.query.filter_by(tag_id=tag.id)
     ]
     members_key = _member_key(members)
     parts: dict[str, tuple[np.ndarray, int]] = {}
@@ -746,8 +891,7 @@ def _rebuild_tag(tag_name: str) -> None:
         vectors = gone["encoder"].embed_many([[text] for text in prose])
         parts[member] = (np.asarray(vectors, dtype=np.float64).sum(axis=0), len(prose))
     current = [
-        member.wiki_username
-        for member in TagMember.query.filter_by(tag_id=tag.id)
+        member.wiki_username for member in TagMember.query.filter_by(tag_id=tag.id)
     ]
     if _member_key(current) != members_key:
         return
@@ -779,6 +923,18 @@ def _ensure_lookup_jobs() -> None:
         db.session.execute(
             db.text(
                 "ALTER TABLE lookup_jobs ADD COLUMN tag_name TEXT NOT NULL DEFAULT ''"
+            )
+        )
+    if "local" not in names:
+        db.session.execute(
+            db.text(
+                "ALTER TABLE lookup_jobs ADD COLUMN local INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    if "public_id" not in names:
+        db.session.execute(
+            db.text(
+                "ALTER TABLE lookup_jobs ADD COLUMN public_id TEXT NOT NULL DEFAULT ''"
             )
         )
     db.session.commit()
@@ -908,6 +1064,7 @@ def _person_rows(
     facts = _facts(names)
     tags = _memberships(names)
     counts = {} if store is None else store.counts()
+    local = {} if store is None else store.local_processors(names)
     rows: list[ViewRow] = []
     for name in names:
         info = facts.get(name_key(name), {})
@@ -920,6 +1077,7 @@ def _person_rows(
                 kind="person",
                 name=name,
                 similarity=score,
+                local_by="" if store is None else local.get(name, ""),
                 stats=account_stats(
                     int(info.get("editcount") or 0),
                     str(info.get("registration") or ""),
@@ -968,15 +1126,12 @@ def _comparison(subject: str, embed_tags: bool = False) -> list[ViewRow]:
     subject_key = name_key(subject)
     for tag in Tag.query.order_by(Tag.name).all():
         members = [
-            member.wiki_username
-            for member in TagMember.query.filter_by(tag_id=tag.id)
+            member.wiki_username for member in TagMember.query.filter_by(tag_id=tag.id)
         ]
         if not members:
             continue
         members_key = _member_key(members)
-        excluded = [
-            member for member in members if name_key(member) != subject_key
-        ]
+        excluded = [member for member in members if name_key(member) != subject_key]
         cached = (
             store.tag_score(subject, tag.name, _member_key(excluded))
             if excluded

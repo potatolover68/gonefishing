@@ -23,8 +23,15 @@ class AuthorStore:
             "user TEXT NOT NULL, revid INTEGER PRIMARY KEY, pageid INTEGER NOT NULL, prose TEXT NOT NULL)"
         )
         self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS vectors (user TEXT PRIMARY KEY, vector BLOB NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS vectors ("
+            "user TEXT PRIMARY KEY, vector BLOB NOT NULL, "
+            "processor TEXT NOT NULL DEFAULT '')"
         )
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(vectors)")}
+        if "processor" not in columns:
+            self._conn.execute(
+                "ALTER TABLE vectors ADD COLUMN processor TEXT NOT NULL DEFAULT ''"
+            )
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS similarities ("
             "query TEXT NOT NULL, other TEXT NOT NULL, score REAL NOT NULL, "
@@ -107,13 +114,27 @@ class AuthorStore:
             return None
         return np.frombuffer(row[0], dtype=np.float32).copy()
 
-    def put_vector(self, user: str, vector: np.ndarray) -> None:
+    def put_vector(self, user: str, vector: np.ndarray, processor: str = "") -> None:
         blob = np.asarray(l2_normalize(vector), dtype=np.float32).tobytes()
         self._conn.execute(
-            "INSERT OR REPLACE INTO vectors (user, vector) VALUES (?, ?)", (user, blob)
+            "INSERT OR REPLACE INTO vectors (user, vector, processor) VALUES (?, ?, ?)",
+            (user, blob, processor),
         )
         self._drop_scores(user)
         self._conn.commit()
+
+    def local_processors(self, names: list[str]) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for start in range(0, len(names), 500):
+            chunk = names[start : start + 500]
+            marks = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"SELECT user, processor FROM vectors WHERE user IN ({marks}) "
+                "AND processor != ''",
+                chunk,
+            ).fetchall()
+            found.update({user: processor for user, processor in rows})
+        return found
 
     def scores_for(self, query: str) -> dict[str, float]:
         rows = self._conn.execute(
@@ -151,7 +172,9 @@ class AuthorStore:
         self._conn.execute("DELETE FROM tag_parts WHERE tag = ?", (tag,))
         self._conn.commit()
 
-    def tag_parts(self, tag: str, members: str) -> dict[str, tuple[np.ndarray, int]] | None:
+    def tag_parts(
+        self, tag: str, members: str
+    ) -> dict[str, tuple[np.ndarray, int]] | None:
         rows = self._conn.execute(
             "SELECT user, count, sum, members FROM tag_parts WHERE tag = ?", (tag,)
         ).fetchall()
@@ -210,7 +233,9 @@ def tag_similarity(
         count += size
     if total is None or count <= 0:
         return None
-    return float(np.dot(l2_normalize(np.asarray(query, dtype=np.float64)), l2_normalize(total)))
+    return float(
+        np.dot(l2_normalize(np.asarray(query, dtype=np.float64)), l2_normalize(total))
+    )
 
 
 def centroid_distances(vectors: dict[str, np.ndarray]) -> dict[str, float]:

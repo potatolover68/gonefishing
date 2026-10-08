@@ -6,7 +6,7 @@
     <a class="tag" href="{{ url_for('tag_page', name=tag.name) }}"
       >{{ tag.name }}</a
     >
-    ({{ count }})
+    ({{ count }}){% if tag.cosmetic %} cosmetic{% endif %}
   </li>
   {% endfor %}
 </ul>

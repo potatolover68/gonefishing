@@ -30,6 +30,14 @@ from flask import (
 from authorship.corpus import Document, load_documents
 from authorship.encode import LuarEncoder, luar_onnx_path
 from authorship.lookup import AuthorStore, centroid_distances, tag_similarity
+from authorship.signals import (
+    blend_similarity,
+    collect_topic_vector,
+    cosine_dicts,
+    cosine_histograms,
+    fact_from_contrib,
+    hour_histogram,
+)
 from diffproc.config import GroupThresholds, PipelineConfig
 from diffproc.fetch import RevisionCache, WikiClient
 from identity import (
@@ -74,6 +82,7 @@ class ViewRow:
     blocklog: str = ""
     pinned: bool = False
     local_by: str = ""
+    similarity_detail: str = ""
 
 
 def wiki_slug(name: str) -> str:
@@ -256,8 +265,16 @@ def create_app(
                 ):
                     notice = EXPERIENCED_NOTICE
         jobs = LookupJob.query.order_by(LookupJob.id.desc()).limit(20).all()
+        tag_names = (
+            [tag.name for tag in Tag.query.order_by(Tag.name).all()] if rows else []
+        )
         return render_template(
-            "index.html", subject=subject, rows=rows, notice=notice, jobs=jobs
+            "index.html",
+            subject=subject,
+            rows=rows,
+            notice=notice,
+            jobs=jobs,
+            tag_names=tag_names,
         )
 
     @app.post("/lookup")
@@ -350,8 +367,8 @@ def create_app(
             for name in request.form.getlist("account")
             if name.strip()
         ]
-        if tag_name and "/" not in tag_name and selected:
-            tag = _tag(tag_name)
+        if tag_name and "/" not in tag_name and "," not in tag_name and selected:
+            tag = _tag(tag_name, cosmetic=request.form.get("cosmetic", "") == "on")
             actor = _current_actor()
             added: list[str] = []
             for name in selected:
@@ -376,8 +393,7 @@ def create_app(
                     users=added,
                     added_by={name: actor.username for name in added},
                 )
-                _forget_tag_scores(tag.name)
-                _enqueue_tag_job(tag.name)
+                _refresh_tag_style(tag)
             db.session.commit()
         return redirect(url_for("index", user=subject) if subject else url_for("index"))
 
@@ -414,6 +430,21 @@ def create_app(
         if updated != previous:
             tag.notes = updated
             _log("note_edit", tag=tag, before=previous, after=updated)
+            db.session.commit()
+        return redirect(url_for("tag_page", name=tag.name))
+
+    @app.post("/tag/<name>/cosmetic")
+    def set_cosmetic(name: str):
+        tag = Tag.query.filter_by(name=name).one_or_none()
+        if tag is None:
+            abort(404)
+        cosmetic = request.form.get("cosmetic", "") == "on"
+        if bool(tag.cosmetic) != cosmetic:
+            tag.cosmetic = cosmetic
+            if cosmetic:
+                _forget_tag_scores(tag.name)
+            else:
+                _enqueue_tag_job(tag.name)
             db.session.commit()
         return redirect(url_for("tag_page", name=tag.name))
 
@@ -469,8 +500,7 @@ def create_app(
             for member in members:
                 db.session.delete(member)
             _log("tag_remove", tag=tag, users=users, added_by=added_by)
-            _forget_tag_scores(tag.name)
-            _enqueue_tag_job(tag.name)
+            _refresh_tag_style(tag)
             db.session.commit()
         return redirect(url_for("tag_page", name=tag.name))
 
@@ -520,8 +550,7 @@ def create_app(
                 )
                 restored.append(name)
             _log("undo_remove", tag=tag, users=restored or users, added_by=adders)
-        _forget_tag_scores(tag.name)
-        _enqueue_tag_job(tag.name)
+        _refresh_tag_style(tag)
         entry.undone = True
         db.session.commit()
         return redirect(url_for("log"))
@@ -695,17 +724,24 @@ def _current_actor() -> AppUser:
     return actor
 
 
-def _tag(name: str) -> Tag:
+def _tag(name: str, *, cosmetic: bool = False) -> Tag:
     cleaned = name.strip()
     existing = Tag.query.filter(
         db.func.lower(Tag.name) == cleaned.casefold()
     ).one_or_none()
     if existing is not None:
         return existing
-    created = Tag(name=cleaned)
+    created = Tag(name=cleaned, cosmetic=cosmetic)
     db.session.add(created)
     db.session.flush()
     return created
+
+
+def _refresh_tag_style(tag: Tag) -> None:
+    if tag.cosmetic:
+        return
+    _forget_tag_scores(tag.name)
+    _enqueue_tag_job(tag.name)
 
 
 def _log(
@@ -751,6 +787,9 @@ def _start_lookup_worker(app: Flask) -> None:
                     .first()
                 )
                 if job is None:
+                    if _backfill_one_signal():
+                        db.session.remove()
+                        continue
                     db.session.remove()
                     time.sleep(1)
                     continue
@@ -803,6 +842,7 @@ def _execute_lookup(job_id: int) -> None:
         kept = _collect(username)
     else:
         kept = store.count(username)
+    _ensure_signals(username)
     if local:
         finished = db.session.get(LookupJob, job_id)
         if finished is None:
@@ -876,7 +916,7 @@ def _rebuild_tag(tag_name: str) -> None:
     gone = _services()
     store: AuthorStore = gone["store"]
     tag = Tag.query.filter_by(name=tag_name).one_or_none()
-    if tag is None:
+    if tag is None or tag.cosmetic:
         store.drop_tag_scores(tag_name)
         return
     members = [
@@ -905,6 +945,11 @@ def _ensure_tag_notes() -> None:
         db.session.execute(
             db.text("ALTER TABLE tags ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
         )
+    if rows and "cosmetic" not in names:
+        db.session.execute(
+            db.text("ALTER TABLE tags ADD COLUMN cosmetic INTEGER NOT NULL DEFAULT 0")
+        )
+    if rows:
         db.session.commit()
 
 
@@ -954,6 +999,7 @@ def _collect(username: str) -> int:
     with _wiki_lock:
         with tempfile.TemporaryDirectory() as directory:
             dest = Path(directory) / "user.jsonl"
+            scanned: list = []
             kept = collect_user(
                 gone["client"],
                 username,
@@ -962,6 +1008,7 @@ def _collect(username: str) -> int:
                 dest,
                 max_useful=MAX_USEFUL,
                 max_scanned=MAX_USEFUL * 10,
+                facts=scanned,
             )
             loaded = [
                 Document(username, document.revid, document.pageid, document.prose)
@@ -970,6 +1017,10 @@ def _collect(username: str) -> int:
             ]
         if loaded:
             gone["store"].replace_user(loaded)
+        gone["store"].replace_facts(
+            username,
+            [fact_from_contrib(contrib, gone["config"]) for contrib in scanned],
+        )
         return kept
 
 
@@ -1113,8 +1164,17 @@ def _comparison(subject: str, embed_tags: bool = False) -> list[ViewRow]:
     ]
     scores = store.scores_for(subject)
     missing = [author for author in authors if author not in scores]
+    busy = {
+        job.wiki_username
+        for job in LookupJob.query.filter(
+            LookupJob.local.is_(True),
+            LookupJob.status.in_(("queued", "running", "ready")),
+        ).all()
+    }
     fresh: dict[str, float] = {}
     for author in missing:
+        if author in busy:
+            continue
         vector = _ensure_vector(author)
         if vector is None:
             continue
@@ -1123,8 +1183,12 @@ def _comparison(subject: str, embed_tags: bool = False) -> list[ViewRow]:
         store.put_scores(subject, fresh)
         scores.update(fresh)
     rows = _person_rows([author for author in authors if author in scores], scores)
+    for row in rows:
+        _apply_blend(row, store, subject)
     subject_key = name_key(subject)
     for tag in Tag.query.order_by(Tag.name).all():
+        if tag.cosmetic:
+            continue
         members = [
             member.wiki_username for member in TagMember.query.filter_by(tag_id=tag.id)
         ]
@@ -1165,5 +1229,69 @@ def _comparison(subject: str, embed_tags: bool = False) -> list[ViewRow]:
     )
     subject_row = _person_rows([subject], {subject: 1.0})[0]
     subject_row.pinned = True
+    _apply_blend(subject_row, store, subject)
     rows.insert(0, subject_row)
     return rows
+
+
+def _backfill_facts(username: str) -> None:
+    gone = _services()
+    with _wiki_lock:
+        contribs = gone["client"].recent_contribs(username, gone["namespaces"], limit=2500)
+    gone["store"].replace_facts(
+        username,
+        [fact_from_contrib(contrib, gone["config"]) for contrib in contribs],
+    )
+
+
+def _backfill_one_signal() -> bool:
+    store: AuthorStore | None = current_app.extensions["gone"].get("store")
+    if store is None:
+        return False
+    missing = store.users_missing_signals(need_topics=True)
+    if not missing:
+        return False
+    username = missing[0]
+    print(f"backfilling signals for {username}", flush=True)
+    _ensure_signals(username)
+    return True
+
+
+def _ensure_signals(username: str) -> None:
+    store: AuthorStore = _services()["store"]
+    if not store.edit_facts(username):
+        _backfill_facts(username)
+    facts = store.edit_facts(username)
+    if not facts:
+        if store.hour_histogram(username) is None:
+            store.put_hour_histogram(username, np.zeros(24))
+        if store.topic_vector(username) is None:
+            store.put_topic_vector(username, {})
+        return
+    if store.hour_histogram(username) is None:
+        bins = hour_histogram(facts)
+        store.put_hour_histogram(username, bins if bins is not None else np.zeros(24))
+    if store.topic_vector(username) is None:
+        topics = collect_topic_vector(facts)
+        if topics is not None:
+            store.put_topic_vector(username, topics)
+
+
+def _apply_blend(row: ViewRow, store: AuthorStore, subject: str) -> None:
+    if row.kind != "person" or row.similarity is None:
+        return
+    if name_key(row.name) == name_key(subject):
+        topic = 1.0 if store.topic_vector(subject) else None
+        time_score = (
+            1.0
+            if (hours := store.hour_histogram(subject)) is not None and float(hours.sum()) > 0
+            else None
+        )
+    else:
+        topic = cosine_dicts(store.topic_vector(subject), store.topic_vector(row.name))
+        time_score = cosine_histograms(
+            store.hour_histogram(subject), store.hour_histogram(row.name)
+        )
+    score, detail = blend_similarity(row.similarity, topic, time_score)
+    row.similarity = score
+    row.similarity_detail = detail

@@ -1,8 +1,21 @@
 {% extends "base.html" %} {% block title %}{{ tag.name }}{% endblock %} {% block
 body %}
-<h1>{{ tag.name }}</h1>
+<h1>{{ tag.name }}{% if tag.cosmetic %} (cosmetic){% endif %}</h1>
 <p id="tag-notes" style="white-space: pre-wrap">{{ tag.notes }}</p>
 <button type="button" id="edit-notes">Edit</button>
+<form method="post" action="{{ url_for('set_cosmetic', name=tag.name) }}">
+  <input type="hidden" name="csrf" value="{{ csrf }}" />
+  <label
+    ><input
+      type="checkbox"
+      name="cosmetic"
+      value="on"
+      {% if tag.cosmetic %}checked{% endif %}
+      onchange="this.form.submit()"
+    />
+    Cosmetic</label
+  >
+</form>
 <form
   id="notes-form"
   method="post"

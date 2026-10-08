@@ -1,11 +1,13 @@
 """Stored author prose and cached LUAR vectors."""
 
+import json
 import sqlite3
 from pathlib import Path
 
 import numpy as np
 
 from authorship.corpus import Document, load_documents
+from authorship.signals import EditFact
 
 
 def l2_normalize(vector: np.ndarray) -> np.ndarray:
@@ -46,6 +48,24 @@ class AuthorStore:
             "CREATE TABLE IF NOT EXISTS tag_parts ("
             "tag TEXT NOT NULL, members TEXT NOT NULL, user TEXT NOT NULL, "
             "count INTEGER NOT NULL, sum BLOB NOT NULL, PRIMARY KEY (tag, user))"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS edit_facts ("
+            "user TEXT NOT NULL, revid INTEGER PRIMARY KEY, pageid INTEGER NOT NULL, "
+            "ns INTEGER NOT NULL, title TEXT NOT NULL, timestamp TEXT NOT NULL, "
+            "sizediff INTEGER NOT NULL, comment TEXT NOT NULL, tags TEXT NOT NULL, "
+            "automated INTEGER NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS edit_facts_user ON edit_facts (user)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS topic_vectors ("
+            "user TEXT PRIMARY KEY, topics TEXT NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS hour_histograms ("
+            "user TEXT PRIMARY KEY, bins BLOB NOT NULL)"
         )
         self._conn.commit()
 
@@ -94,6 +114,116 @@ class AuthorStore:
                 (document.user, document.revid, document.pageid, document.prose)
                 for document in documents
             ],
+        )
+        self._conn.commit()
+
+    def users_missing_signals(self, *, need_topics: bool = True) -> list[str]:
+        have_facts = {
+            row[0]
+            for row in self._conn.execute("SELECT DISTINCT user FROM edit_facts")
+        }
+        have_hours = {
+            row[0]
+            for row in self._conn.execute("SELECT user FROM hour_histograms")
+        }
+        have_topics = {
+            row[0]
+            for row in self._conn.execute("SELECT user FROM topic_vectors")
+        }
+        missing: list[str] = []
+        for user in self.users():
+            if user not in have_facts or user not in have_hours:
+                missing.append(user)
+            elif need_topics and user not in have_topics:
+                missing.append(user)
+        return missing
+
+    def edit_facts(self, user: str) -> list[EditFact]:
+        rows = self._conn.execute(
+            "SELECT user, revid, pageid, ns, title, timestamp, sizediff, comment, tags, automated "
+            "FROM edit_facts WHERE user = ? ORDER BY revid",
+            (user,),
+        ).fetchall()
+        facts: list[EditFact] = []
+        for row in rows:
+            tags = json.loads(row[8] or "[]")
+            facts.append(
+                EditFact(
+                    user=row[0],
+                    revid=int(row[1]),
+                    pageid=int(row[2]),
+                    ns=int(row[3]),
+                    title=row[4],
+                    timestamp=row[5],
+                    sizediff=int(row[6]),
+                    comment=row[7],
+                    tags=tuple(str(tag) for tag in tags),
+                    automated=bool(row[9]),
+                )
+            )
+        return facts
+
+    def replace_facts(self, user: str, facts: list[EditFact]) -> None:
+        self._conn.execute("DELETE FROM edit_facts WHERE user = ?", (user,))
+        self._conn.execute("DELETE FROM topic_vectors WHERE user = ?", (user,))
+        self._conn.execute("DELETE FROM hour_histograms WHERE user = ?", (user,))
+        if facts:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO edit_facts "
+                "(user, revid, pageid, ns, title, timestamp, sizediff, comment, tags, automated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        fact.user,
+                        fact.revid,
+                        fact.pageid,
+                        fact.ns,
+                        fact.title,
+                        fact.timestamp,
+                        fact.sizediff,
+                        fact.comment,
+                        json.dumps(list(fact.tags)),
+                        1 if fact.automated else 0,
+                    )
+                    for fact in facts
+                ],
+            )
+        self._conn.commit()
+
+    def topic_vector(self, user: str) -> dict[str, float] | None:
+        row = self._conn.execute(
+            "SELECT topics FROM topic_vectors WHERE user = ?", (user,)
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[0] or "{}")
+        if not isinstance(payload, dict):
+            return None
+        return {str(topic): float(score) for topic, score in payload.items()}
+
+    def put_topic_vector(self, user: str, topics: dict[str, float]) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO topic_vectors (user, topics) VALUES (?, ?)",
+            (user, json.dumps(topics)),
+        )
+        self._conn.commit()
+
+    def hour_histogram(self, user: str) -> np.ndarray | None:
+        row = self._conn.execute(
+            "SELECT bins FROM hour_histograms WHERE user = ?", (user,)
+        ).fetchone()
+        if row is None:
+            return None
+        bins = np.frombuffer(row[0], dtype=np.float64).copy()
+        if bins.shape != (24,):
+            return None
+        return bins
+
+    def put_hour_histogram(self, user: str, bins: np.ndarray) -> None:
+        blob = np.asarray(bins, dtype=np.float64).tobytes()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO hour_histograms (user, bins) VALUES (?, ?)",
+            (user, blob),
         )
         self._conn.commit()
 

@@ -22,6 +22,7 @@
         data-created="{{ row.created }}"
         data-blocked="{{ '1' if row.blocked else '0' }}"
         data-pin="{{ '1' if row.pinned else '0' }}"
+        data-tags="{% for tag_name, adder in row.tags %}{{ tag_name }}{% if not loop.last %}|{% endif %}{% endfor %}"
       >
         <td>
           {% if row.kind == "person" %}<input
@@ -53,11 +54,17 @@
         </td>
         {% if show_similarity %}
         <td>
-          {% if row.similarity is not none %}{% if row.local_by %}<span
-            style="text-decoration: underline dotted"
-            title="Locally processed by {{ row.local_by }}"
+          {% if row.similarity is not none %}
+          {% set detail = row.similarity_detail %}
+          {% if row.local_by %}
+          {% set detail = detail ~ (", " if detail else "") ~ "Locally processed by " ~ row.local_by %}
+          {% endif %}
+          <span
+            {% if row.local_by %}style="text-decoration: underline dotted"{% endif %}
+            {% if detail %}title="{{ detail }}"{% endif %}
             >{{ "%.4f"|format(row.similarity) }}</span
-          >{% else %}{{ "%.4f"|format(row.similarity) }}{% endif %}{% endif %}
+          >
+          {% endif %}
         </td>
         {% endif %}
       </tr>
@@ -72,11 +79,63 @@
     var maxEdits = document.getElementById("max-edits");
     var createdBefore = document.getElementById("created-before");
     var blockedOnly = document.getElementById("blocked-only");
+    var tagged = document.getElementById("tagged");
+    var notTagged = document.getElementById("not-tagged");
     var main = document.getElementById("main-rows");
     var tail = document.getElementById("tail-rows");
     var last = null;
-    if (!query || !maxEdits || !createdBefore || !blockedOnly || !main || !tail)
+    var filterKey = "gonefishing-filters";
+    if (
+      !query ||
+      !maxEdits ||
+      !createdBefore ||
+      !blockedOnly ||
+      !tagged ||
+      !notTagged ||
+      !main ||
+      !tail
+    )
       return;
+
+    function listed(value) {
+      return value
+        .split(",")
+        .map(function (part) {
+          return part.trim().toLowerCase();
+        })
+        .filter(Boolean);
+    }
+
+    function rowTags(row) {
+      return (row.dataset.tags || "")
+        .split("|")
+        .map(function (part) {
+          return part.trim().toLowerCase();
+        })
+        .filter(Boolean);
+    }
+
+    function writeFilters() {
+      localStorage.setItem(
+        filterKey,
+        JSON.stringify({
+          q: query.value,
+          maxEdits: maxEdits.value,
+          createdBefore: createdBefore.value,
+          blockedOnly: blockedOnly.checked,
+          tagged: tagged.value,
+          notTagged: notTagged.value,
+        }),
+      );
+    }
+
+    function readFilters() {
+      try {
+        return JSON.parse(localStorage.getItem(filterKey) || "{}");
+      } catch (error) {
+        return {};
+      }
+    }
 
     function boxes() {
       return Array.prototype.slice.call(
@@ -106,6 +165,21 @@
         return false;
       }
       if (blockedOnly.checked && row.dataset.blocked !== "1") return false;
+      var names = rowTags(row);
+      var required = listed(tagged.value);
+      var excluded = listed(notTagged.value);
+      if (
+        required.some(function (name) {
+          return names.indexOf(name) === -1;
+        })
+      )
+        return false;
+      if (
+        excluded.some(function (name) {
+          return names.indexOf(name) !== -1;
+        })
+      )
+        return false;
       return true;
     }
 
@@ -143,10 +217,27 @@
       });
     }
 
-    query.addEventListener("input", applyFilter);
-    maxEdits.addEventListener("input", applyFilter);
-    createdBefore.addEventListener("input", applyFilter);
-    blockedOnly.addEventListener("change", applyFilter);
+    var savedFilters = readFilters();
+    if (savedFilters.q) query.value = savedFilters.q;
+    if (savedFilters.maxEdits) maxEdits.value = savedFilters.maxEdits;
+    if (savedFilters.createdBefore)
+      createdBefore.value = savedFilters.createdBefore;
+    blockedOnly.checked = !!savedFilters.blockedOnly;
+    if (savedFilters.tagged) tagged.value = savedFilters.tagged;
+    if (savedFilters.notTagged) notTagged.value = savedFilters.notTagged;
+
+    function onFilter() {
+      writeFilters();
+      applyFilter();
+    }
+
+    query.addEventListener("input", onFilter);
+    maxEdits.addEventListener("input", onFilter);
+    createdBefore.addEventListener("input", onFilter);
+    blockedOnly.addEventListener("change", onFilter);
+    tagged.addEventListener("input", onFilter);
+    notTagged.addEventListener("input", onFilter);
+    applyFilter();
     document
       .getElementById("select-all")
       .addEventListener("click", function () {

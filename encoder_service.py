@@ -5,14 +5,17 @@ import subprocess
 import sys
 import threading
 import time
-from multiprocessing.managers import BaseManager
+from multiprocessing.managers import BaseManager, RemoteError
 from pathlib import Path
 
 import numpy as np
 
+from authorship.lookup import l2_normalize
+
 ADDRESS = ("127.0.0.1", 8766)
 AUTHKEY = b"gonefishing-encoder"
 ROOT = Path(__file__).resolve().parent
+REMOTE_BATCH = 16
 
 
 class _EncoderProxy:
@@ -48,14 +51,41 @@ def _connect():
 
 class RemoteLuarEncoder:
     def __init__(self) -> None:
+        self._manager = None
+        self._encoder = None
+        self._connect_encoder()
+
+    def _connect_encoder(self) -> None:
+        try:
+            self._manager = _connect()
+            self._encoder = self._manager.encoder()
+            return
+        except (ConnectionRefusedError, EOFError, OSError, AttributeError, RemoteError):
+            pass
+        ensure_encoder_server()
         self._manager = _connect()
         self._encoder = self._manager.encoder()
 
+    def _call(self, method: str, arg):
+        try:
+            return getattr(self._encoder, method)(arg)
+        except (RemoteError, EOFError, ConnectionResetError, BrokenPipeError, OSError):
+            self._connect_encoder()
+            return getattr(self._encoder, method)(arg)
+
     def embed_episode(self, texts) -> np.ndarray:
-        return np.asarray(self._encoder.embed_episode(list(texts)))
+        vectors = self.embed_many([[text] for text in texts])
+        return l2_normalize(vectors.mean(axis=0))
 
     def embed_many(self, episodes) -> np.ndarray:
-        return np.asarray(self._encoder.embed_many(list(episodes)))
+        episodes = list(episodes)
+        rows = []
+        for start in range(0, len(episodes), REMOTE_BATCH):
+            chunk = episodes[start : start + REMOTE_BATCH]
+            rows.append(np.asarray(self._call("embed_many", chunk)))
+        if not rows:
+            raise ValueError("expected at least one text")
+        return np.concatenate(rows, axis=0)
 
 
 def _register(encoder) -> None:

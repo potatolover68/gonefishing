@@ -150,6 +150,15 @@ class WikiClient:
         if not manager.login():
             raise RuntimeError("login failed")
 
+    def recent_contribs(self, user: str, namespaces: list[int], limit: int = 2500) -> list[Contrib]:
+        rows = self.site.usercontribs(
+            user=user,
+            namespaces=namespaces,
+            prop=_CONTRIB_PROPS,
+            total=limit,
+        )
+        return [_contrib_from_usercontribs(row, user) for row in rows]
+
     def iter_user_contribs(self, user: str, namespaces: list[int]) -> Iterator[Contrib]:
         rows = self.site.usercontribs(
             user=user,

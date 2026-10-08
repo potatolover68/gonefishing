@@ -53,6 +53,56 @@ def test_adding_accounts_to_a_tag_is_queued(tmp_path, monkeypatch):
     assert b"tag update - queued" in page.data
 
 
+def test_cosmetic_tag_is_not_aggregated(tmp_path, monkeypatch):
+    from factory import create_app
+    from models import AppUser, LookupJob, Tag, db
+
+    monkeypatch.setenv("GONEFISHING_NO_JOBS", "1")
+    monkeypatch.setattr("factory._forget_tag_scores", lambda name: None)
+    app = create_app(init_heavy=False, db_path=tmp_path / "app.sqlite")
+    with app.app_context():
+        actor = AppUser(username="MSK")
+        db.session.add(actor)
+        db.session.commit()
+        actor_id = actor.id
+    client = app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = actor_id
+        sess["username"] = "MSK"
+        sess["csrf"] = "token"
+
+    created = client.post(
+        "/tags",
+        data={
+            "csrf": "token",
+            "tag": "Labels",
+            "account": ["Ada"],
+            "cosmetic": "on",
+        },
+    )
+    assert created.status_code == 302
+    with app.app_context():
+        tag = Tag.query.filter_by(name="Labels").one()
+        assert tag.cosmetic is True
+        assert LookupJob.query.filter_by(kind="tag").count() == 0
+
+    again = client.post(
+        "/tags",
+        data={"csrf": "token", "tag": "Labels", "account": ["Bea"], "cosmetic": "on"},
+    )
+    assert again.status_code == 302
+    with app.app_context():
+        assert Tag.query.filter_by(name="Labels").one().cosmetic is True
+
+    page = client.get("/tag/Labels")
+    assert b"Cosmetic" in page.data
+    turned_off = client.post("/tag/Labels/cosmetic", data={"csrf": "token"})
+    assert turned_off.status_code == 302
+    with app.app_context():
+        assert Tag.query.filter_by(name="Labels").one().cosmetic is False
+        assert LookupJob.query.filter_by(kind="tag", tag_name="Labels").count() == 1
+
+
 def test_centroid_distance_is_zero_for_the_same_vector():
     same = np.array([1.0, 0.0], dtype=np.float32)
     other = np.array([0.0, 1.0], dtype=np.float32)

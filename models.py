@@ -18,6 +18,7 @@ class Tag(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(255), unique=True, nullable=False)
     notes = db.Column(db.Text, nullable=False, default="")
+    cosmetic = db.Column(db.Boolean, nullable=False, default=False)
 
 
 class TagMember(db.Model):

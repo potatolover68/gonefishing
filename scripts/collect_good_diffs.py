@@ -72,6 +72,7 @@ def collect_user(
     dest: Path,
     max_useful: int = TARGET,
     max_scanned: int = MAX_CONTRIBS,
+    facts: list | None = None,
 ) -> int:
     kept = 0
     scanned = 0
@@ -114,6 +115,8 @@ def collect_user(
             scanned += 1
             if scanned > max_scanned or kept >= max_useful:
                 return
+            if facts is not None:
+                facts.append(contrib)
             yield contrib
 
     for session in iter_sessions(limited(), config):

@@ -268,7 +268,10 @@ class AuthorStore:
 
     def scores_for(self, query: str) -> dict[str, float]:
         rows = self._conn.execute(
-            "SELECT other, score FROM similarities WHERE query = ?", (query,)
+            "SELECT other, score FROM similarities WHERE query = ? "
+            "UNION ALL "
+            "SELECT query, score FROM similarities WHERE other = ?",
+            (query, query),
         ).fetchall()
         return {other: float(score) for other, score in rows}
 

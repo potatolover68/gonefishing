@@ -23,6 +23,7 @@ def test_store_roundtrip_and_rank(tmp_path):
     assert [name for name, _score in ranked] == ["Bea"]
     store.put_scores("Ada", {"Bea": 0.5})
     assert store.scores_for("Ada")["Bea"] == 0.5
+    assert store.scores_for("Bea")["Ada"] == 0.5
     store.put_tag_score("Ada", "socks", "\nBea\n", 0.25)
     assert store.tag_score("Ada", "socks", "\nBea\n") == 0.25
     store.put_vector("Bea", bea)

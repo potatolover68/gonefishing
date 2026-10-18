@@ -250,7 +250,7 @@ def create_app(
                     notice = _busy_notice(running, subject)
                 else:
                     notice = f"{subject} is waiting in the queue."
-            elif _local_waiting(subject):
+            elif _local_waiting(subject) and not _services()["store"].has_user(subject):
                 notice = f"Waiting for a local embedding of {subject}."
             elif not _services()["store"].has_user(subject):
                 notice = "No usable edits were stored for that account."

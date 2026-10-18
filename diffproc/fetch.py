@@ -249,6 +249,6 @@ def _contrib_from_usercontribs(row: dict, user: str) -> Contrib:
         comment=row.get("comment") or "",
         sizediff=int(row.get("sizediff") or 0),
         tags=frozenset(row.get("tags") or []),
-        is_new=bool(row.get("new")),
+        is_new="new" in row,
         user=user,
     )

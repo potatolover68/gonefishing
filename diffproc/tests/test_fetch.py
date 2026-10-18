@@ -3,7 +3,7 @@ import threading
 import pytest
 
 from diffproc.config import PipelineConfig
-from diffproc.fetch import RevisionCache, WikiClient, _is_wiki_cookie
+from diffproc.fetch import RevisionCache, WikiClient, _contrib_from_usercontribs, _is_wiki_cookie
 
 
 def _config() -> PipelineConfig:
@@ -13,6 +13,17 @@ def _config() -> PipelineConfig:
 def test_bot_request_limit_is_500():
     assert PipelineConfig().request_limit() == 50
     assert PipelineConfig(is_bot=True).request_limit() == 500
+
+
+def test_page_creation_flag_is_an_empty_string():
+    created = _contrib_from_usercontribs(
+        {"revid": 5, "parentid": 0, "pageid": 9, "ns": 0, "title": "New", "new": ""},
+        "Ada",
+    )
+    assert created.is_new is True
+    assert created.parentid == 0
+    edited = _contrib_from_usercontribs({"revid": 6, "parentid": 5}, "Ada")
+    assert edited.is_new is False
 
 
 def _pages(revisions: list[dict]) -> dict:
